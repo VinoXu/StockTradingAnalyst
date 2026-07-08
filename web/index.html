@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PROFIT PROTECTOR</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link href="https://cdn.jsdelivr.net/npm/font-awesome@4.7.0/css/font-awesome.min.css" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            primary: '#165DFF', primaryDark: '#0F48D1', primaryLight: '#4080FF', primaryBg: '#E8F3FF',
+            pageBg: '#F7F8FA', blockBorder: '#DCDFE6', gapBg: '#F2F3F5',
+            textMain: '#1D2129', textSub: '#4E5969', textPlaceholder: '#86909C',
+            rise: '#00B42A', fall: '#F53F3F'
+          },
+          boxShadow: {
+            flat: '0 1px 4px 0 rgba(0,0,0,0.04)',
+            btn3d: '0 4px 0 #0F48D1, 0 6px 14px rgba(22, 93, 255, 0.22)',
+            btn3dHover: '0 2px 0 #0F48D1, 0 4px 10px rgba(22, 93, 255, 0.2)',
+            btn3dActive: '0 1px 0 #0F48D1, 0 2px 4px rgba(22, 93, 255, 0.15)',
+            card: '0 2px 8px rgba(0,0,0,0.06)',
+          }
+        }
+      }
+    }
+  </script>
+  <style type="text/tailwindcss">
+    @layer utilities {
+      .nav-active { @apply border-l-[4px] border-primary bg-primaryBg text-primary font-medium; }
+      .btn-3d { @apply relative inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl font-medium transition-all duration-150 select-none; box-shadow: 0 4px 0 #0F48D1, 0 6px 14px rgba(22,93,255,0.18); transform: translateY(0); }
+      .btn-3d:hover { transform: translateY(-2px); box-shadow: 0 5px 0 #0F48D1, 0 8px 18px rgba(22,93,255,0.24); }
+      .btn-3d:active { transform: translateY(3px); box-shadow: 0 1px 0 #0F48D1, 0 2px 6px rgba(22,93,255,0.15); }
+      .btn-3d:disabled { @apply opacity-50 cursor-not-allowed; transform: none !important; box-shadow: 0 2px 0 #C9CDD4 !important; }
+      .btn-3d-primary { @apply bg-gradient-to-b from-primaryLight to-primary text-white border border-primaryDark; }
+      .btn-3d-white { @apply bg-white text-textSub border border-blockBorder; box-shadow: 0 3px 0 #DCDFE6, 0 5px 12px rgba(0,0,0,0.06); }
+      .btn-3d-white:hover { box-shadow: 0 4px 0 #DCDFE6, 0 7px 14px rgba(0,0,0,0.08); }
+      .btn-3d-white:active { box-shadow: 0 1px 0 #DCDFE6; }
+      .btn-quick-3d { @apply btn-3d btn-3d-white text-sm; }
+      .clean-card { @apply w-full bg-white border border-blockBorder rounded-xl shadow-card overflow-hidden; }
+      .input-clean { @apply w-full bg-white rounded-xl px-4 py-3 border border-blockBorder focus:outline-none transition-all duration-200; }
+      .input-clean:focus { @apply border-primary ring-2 ring-primary/10; }
+      .send-btn-3d { @apply btn-3d btn-3d-primary w-12 h-12 rounded-xl flex-shrink-0; }
+      .icon-btn-slim { @apply w-9 h-9 rounded-xl flex items-center justify-center text-textSub hover:bg-primaryBg hover:text-primary transition-all cursor-pointer border border-transparent hover:border-primary/20; }
+      .bubble-ai { @apply bg-white border border-blockBorder text-textMain rounded-2xl rounded-tl-md px-4 py-3 text-sm leading-relaxed shadow-flat; }
+      .bubble-user { @apply bg-gradient-to-br from-primaryLight to-primary text-white rounded-2xl rounded-tr-md px-4 py-3 text-sm leading-relaxed shadow-btn3d; }
+      .bubble-typing { @apply bubble-ai text-textPlaceholder italic; }
+      .history-item { @apply p-4 border border-blockBorder rounded-xl hover:border-primary hover:bg-primaryBg/30 transition-all; }
+      .stock-row { @apply flex items-center gap-3 py-3 px-3 border border-blockBorder rounded-xl mb-2 hover:shadow-flat transition-all bg-white; }
+      .modal-backdrop {
+        position: fixed; inset: 0; z-index: 50;
+        display: none; align-items: center; justify-content: center;
+        background: rgba(0, 0, 0, 0.4);
+        backdrop-filter: blur(4px);
+        -webkit-backdrop-filter: blur(4px);
+      }
+      .modal-backdrop.is-open { display: flex; }
+      #stockPickerModal { z-index: 60; }
+      .modal-panel { @apply bg-white rounded-2xl shadow-lg w-full max-w-md mx-4 p-6 border border-blockBorder; }
+      .toast { @apply fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] px-5 py-3 rounded-xl shadow-lg text-sm text-white max-w-lg text-center transition-opacity duration-300; }
+      .chat-scroll { scroll-behavior: smooth; }
+      /* 以下用纯 CSS，不依赖 Tailwind 扫描 JS 动态类名 */
+      .chat-row-user { display: flex; width: 100%; justify-content: flex-end; }
+      .chat-row-ai { display: flex; width: 100%; justify-content: flex-start; }
+      .chat-wrap-user { max-width: 72%; margin-left: auto; }
+      .chat-wrap-ai { max-width: 88%; display: flex; flex-direction: column; gap: 0.5rem; }
+      .time-banner {
+        font-size: 11px; color: #4E5969; background: #F2F3F5;
+        border: 1px solid #DCDFE6; border-radius: 10px;
+        padding: 8px 12px; line-height: 1.65; white-space: pre-wrap;
+      }
+      .outlook-panel { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+      .outlook-card { background: #fff; border: 1px solid #DCDFE6; border-radius: 12px; padding: 10px 12px; box-shadow: 0 1px 4px rgba(0,0,0,0.04); }
+      .outlook-card-title { font-size: 14px; font-weight: 600; color: #1D2129; margin-bottom: 8px; }
+      .outlook-row { display: flex; flex-wrap: wrap; gap: 8px; }
+      .outlook-chip { display: flex; flex-direction: column; gap: 2px; border-radius: 10px; padding: 8px 12px; min-width: 120px; flex: 1; border: 1px solid; }
+      .outlook-chip-label { font-size: 11px; color: #86909C; }
+      .outlook-chip-value { font-size: 14px; font-weight: 600; }
+      .outlook-bullish { background: rgba(0,180,42,0.08); border-color: rgba(0,180,42,0.35); color: #00B42A; }
+      .outlook-bearish { background: rgba(245,63,63,0.08); border-color: rgba(245,63,63,0.35); color: #F53F3F; }
+      .outlook-neutral { background: #F2F3F5; border-color: #DCDFE6; color: #4E5969; }
+      .selected-bar #selectedSummary { font-size: 0.9375rem; color: #1D2129; font-weight: 500; }
+    }
+  </style>
+</head>
+<body class="bg-pageBg text-textMain h-screen flex flex-col overflow-hidden font-sans">
+  <div id="toast" class="toast hidden opacity-0 bg-textMain"></div>
+
+  <div class="flex flex-1 overflow-hidden">
+    <aside class="w-52 bg-white border-r border-blockBorder flex-shrink-0 flex flex-col py-8">
+      <div class="px-5 mb-6">
+        <div class="text-sm font-semibold tracking-wide">PROFIT PROTECTOR</div>
+        <button id="statusLine" type="button" class="text-xs text-textPlaceholder mt-1 flex items-center gap-1.5 hover:text-primary transition-colors">
+          <span id="statusDot" class="w-2 h-2 rounded-full bg-textDisabled"></span>
+          <span id="statusText">检测中…</span>
+        </button>
+      </div>
+      <nav class="space-y-1.5 px-3 flex-1">
+        <div class="nav-active flex items-center gap-3 px-3 py-3.5 rounded-r-lg cursor-pointer" data-view="chat">
+          <i class="fa fa-comments-o text-lg w-5 text-center"></i><span>新建对话</span>
+        </div>
+        <div class="flex items-center gap-3 px-3 py-3.5 rounded-r-lg cursor-pointer hover:bg-gapBg transition-all" data-view="history">
+          <i class="fa fa-history text-lg w-5 text-center text-textSub"></i><span class="text-textSub">对话历史</span>
+        </div>
+        <div class="flex items-center gap-3 px-3 py-3.5 rounded-r-lg cursor-pointer hover:bg-gapBg transition-all" data-view="stockList">
+          <i class="fa fa-list-alt text-lg w-5 text-center text-textSub"></i><span class="text-textSub">自选股管理</span>
+        </div>
+      </nav>
+      <div class="px-3 pb-2">
+        <button id="openSettings" class="w-full flex items-center gap-3 px-3 py-3 rounded-xl text-textSub hover:bg-gapBg transition-all text-sm">
+          <i class="fa fa-cog w-5 text-center"></i><span>API 设置</span>
+        </button>
+      </div>
+    </aside>
+
+    <main class="flex-1 flex flex-col p-6 gap-4 overflow-hidden">
+      <div id="view-chat" class="flex-1 flex flex-col overflow-hidden min-h-0">
+        <div class="clean-card flex flex-col h-full relative min-h-0">
+          <div class="absolute top-3 right-3 z-10">
+            <button id="newChatBtn" class="icon-btn-slim" title="新建对话"><i class="fa fa-refresh"></i></button>
+          </div>
+          <div id="chatMessages" class="chat-scroll flex-1 overflow-y-auto p-5 pt-12 space-y-4 min-h-0">
+            <div id="chatEmpty" class="text-textPlaceholder text-sm text-center py-16">点击上方选择分析标的，在下方输入问题开始对话</div>
+          </div>
+          <div id="loadingBar" class="hidden absolute bottom-0 left-0 right-0 h-1 bg-primary/20"><div class="h-full w-1/3 bg-primary animate-pulse"></div></div>
+        </div>
+      </div>
+
+      <div id="view-history" class="hidden flex-1 clean-card flex flex-col overflow-hidden min-h-0">
+        <div class="flex justify-between items-center p-4 border-b border-blockBorder">
+          <span class="text-sm text-textSub">近 30 天对话 session（每条含多轮，点击继续）</span>
+          <button id="clearHistoryBtn" class="btn-3d btn-3d-white text-xs py-1.5 px-3 text-fall border-fall/30">清空全部</button>
+        </div>
+        <div id="historyList" class="flex-1 overflow-y-auto p-4 space-y-3"></div>
+      </div>
+
+      <div id="view-stockList" class="hidden flex-1 clean-card flex flex-col overflow-hidden min-h-0">
+        <div class="p-4 border-b border-blockBorder space-y-3">
+          <div class="flex gap-2 flex-wrap items-center">
+            <input id="inlineStockCode" class="input-clean flex-1 min-w-[160px]" placeholder="输入代码，多个用空格或逗号分隔，如 600000 510300">
+            <button id="inlineAddStock" class="btn-3d btn-3d-primary text-sm whitespace-nowrap"><i class="fa fa-plus"></i>添加</button>
+          </div>
+          <div class="flex justify-between items-center flex-wrap gap-2">
+            <div class="flex gap-3 text-sm">
+              <button id="listSelectAll" class="text-xs text-primary hover:underline">全选</button>
+              <button id="listClearAll" class="text-xs text-textSub hover:underline">清除</button>
+            </div>
+            <div class="flex gap-2 flex-wrap">
+              <button id="syncAllBtn" class="btn-quick-3d text-sm py-2"><i class="fa fa-cloud-download"></i>同步全部</button>
+              <button id="syncSelectedBtn" class="btn-quick-3d text-sm py-2"><i class="fa fa-refresh"></i>同步选中</button>
+            </div>
+          </div>
+        </div>
+        <div id="stockListBody" class="flex-1 overflow-y-auto p-4"></div>
+      </div>
+
+      <div id="chatFooter" class="flex flex-col gap-3 flex-shrink-0">
+        <div id="selectedBar" class="selected-bar bg-white border border-blockBorder rounded-xl px-4 py-3 flex items-center justify-between gap-3 shadow-flat">
+          <span id="selectedSummary" class="text-sm text-textMain leading-relaxed flex-1 min-w-0">当前分析标的：未选择（将按提问智能匹配板块与数据）</span>
+          <button type="button" id="openStockPickerBtn" class="btn-3d btn-3d-primary text-sm py-2 px-4 whitespace-nowrap flex-shrink-0">
+            <i class="fa fa-exchange"></i> 切换标的
+          </button>
+        </div>
+        <div class="flex gap-2 flex-wrap">
+          <button class="btn-quick-3d text-sm" data-fill="帮我分析今日A股大盘整体行情、市场情绪、两市成交额、涨跌家数、主要指数表现" data-market="1" data-send="1"><i class="fa fa-area-chart"></i>今日大盘</button>
+          <button class="btn-quick-3d text-sm" data-fill="梳理今日存在回调风险、资金流出、利空催化的板块，说明风险逻辑" data-market="1" data-send="1"><i class="fa fa-exclamation-triangle"></i>风险板块</button>
+          <button class="btn-quick-3d text-sm" data-fill="梳理今日资金持续流入、政策利好、具备上涨潜力的主线板块，标注核心龙头" data-market="1" data-send="1"><i class="fa fa-trophy"></i>机会板块</button>
+        </div>
+        <div id="contextLimitBanner" class="hidden flex items-center justify-between gap-3 px-4 py-3 rounded-xl border border-amber-200 bg-amber-50 text-sm text-amber-900">
+          <span id="contextLimitText" class="flex-1 leading-relaxed"></span>
+          <button type="button" id="contextLimitNewChat" class="btn-3d btn-3d-primary text-sm py-2 px-3 whitespace-nowrap flex-shrink-0">新建对话</button>
+        </div>
+        <div id="analyzingBanner" class="hidden flex items-center justify-between gap-3 px-4 py-3 rounded-xl border border-primary/20 bg-primary/5 text-sm text-textMain">
+          <span id="analyzingStatusText" class="flex-1 leading-relaxed">正在分析，请稍候…</span>
+          <button type="button" id="cancelChatBtn" class="btn-3d btn-3d-white text-sm py-2 px-3 whitespace-nowrap flex-shrink-0 text-fall border-fall/30">
+            <i class="fa fa-stop-circle"></i> 停止分析
+          </button>
+        </div>
+        <div class="flex gap-3 items-end">
+          <textarea id="inputBottom" rows="2" class="input-clean flex-1 resize-y min-h-[52px] max-h-[200px] leading-relaxed" placeholder="输入问题，Enter 发送，Shift+Enter 换行"></textarea>
+          <button id="sendBtn" class="send-btn-3d"><i class="fa fa-paper-plane text-lg"></i></button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div id="settingsModal" class="modal-backdrop">
+    <div class="modal-panel max-w-lg">
+      <h3 class="text-lg font-medium mb-2">大模型 API 设置</h3>
+      <p class="text-xs text-textSub mb-4">支持 OpenAI 兼容接口（百炼、DeepSeek、自建网关等），配置保存在本地 <code class="text-primary">.env</code></p>
+      <label class="block text-sm text-textSub mb-1">接入方式</label>
+      <select id="providerInput" class="input-clean mb-3">
+        <option value="openai">OpenAI 兼容 API（推荐）</option>
+        <option value="bailian">阿里云百炼</option>
+        <option value="ollama">本地 Ollama</option>
+      </select>
+      <label class="block text-sm text-textSub mb-1">API Base URL</label>
+      <input id="baseUrlInput" class="input-clean mb-3" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1">
+      <label class="block text-sm text-textSub mb-1">API Key</label>
+      <input id="apiKeyInput" type="password" class="input-clean mb-1" placeholder="留空则不修改已有 Key">
+      <p id="apiKeyHint" class="text-xs text-textPlaceholder mb-3"></p>
+      <label class="block text-sm text-textSub mb-1">模型名称</label>
+      <input id="modelInput" class="input-clean mb-2" placeholder="deepseek-r1">
+      <p id="settingsStatus" class="text-xs text-textSub mb-4 min-h-[1.25rem]"></p>
+      <div class="flex justify-between gap-3">
+        <button id="testSettings" class="btn-3d btn-3d-white text-sm">测试连接</button>
+        <div class="flex gap-2">
+          <button id="closeSettings" class="btn-3d btn-3d-white text-sm">取消</button>
+          <button id="saveSettings" class="btn-3d btn-3d-primary text-sm">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="stockPickerModal" class="modal-backdrop">
+    <div class="modal-panel max-w-lg">
+      <h3 class="text-lg font-medium mb-1">切换分析标的</h3>
+      <p class="text-xs text-textSub mb-3">勾选参与本次问答的股票</p>
+      <div class="flex gap-2 mb-3 flex-wrap">
+        <button id="pickerSelectAll" class="btn-quick-3d text-sm py-2">全选</button>
+        <button id="pickerClearAll" class="btn-quick-3d text-sm py-2">清除</button>
+      </div>
+      <div id="pickerList" class="max-h-72 overflow-y-auto p-1 mb-3"></div>
+      <p id="pickerCount" class="text-xs text-textSub mb-3">已选 0 只</p>
+      <div class="flex justify-end gap-2">
+        <button id="cancelPicker" class="btn-3d btn-3d-white text-sm">取消</button>
+        <button id="confirmPicker" class="btn-3d btn-3d-primary text-sm">确认</button>
+      </div>
+    </div>
+  </div>
+
+  <footer class="text-center text-xs text-textSub py-4 px-4 border-t border-border">
+    本工具仅供学习研究，不构成投资建议，非买卖指令。分析结果可能存在延迟与误差，使用者须自行承担风险。
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="/static/app.js?v=21"></script>
+</body>
+</html>

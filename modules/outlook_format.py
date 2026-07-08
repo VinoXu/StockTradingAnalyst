@@ -1,0 +1,153 @@
+"""Parse and format short/medium-term outlook from LLM replies."""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+OUTLOOK_SECTION_TITLE = "【观点结论】"
+
+OUTLOOK_INSTRUCTION = """
+回答涉及具体标的/个股/ETF 分析时，在正文展开之前必须先输出「观点结论」块，格式如下（纯文本，禁止 Markdown）：
+
+【观点结论】
+（若多只标的，每只一段，先写名称或代码）
+短期（1～3个交易日）：偏多观察 / 偏空观察 / 观望 三选一
+中期（1～2周）：偏多观察 / 偏空观察 / 观望 三选一
+
+要求：
+1. 「短期」「中期」两行必须各出现且只能三选一用词
+2. 禁止用买入/卖出，只用偏多观察、偏空观察、观望
+3. 写完观点结论块后空一行，再写分析正文
+4. 大盘/纯板块问题可省略此块
+"""
+
+GUIDANCE_CLOSING_INSTRUCTION = """
+正文写完后，最后用 1～2 句直接说仓位态度（不要加小标题，不要写「指导建议」「口诀」「批语」）：
+例：指数靠权重股撑着、多数个股在跌，建议轻仓观望，{sector_label}冲高就减仓，别加仓。
+例：盘面偏强、资金有承接，可以小仓位关注{sector_label}，不追涨。
+例：指数像诱多、个股跟不上，建议减仓，{sector_label}别新开仓。
+例：跌得凶、承接弱，建议减仓或空仓，先别碰{sector_label}。
+按本轮盘面选最接近的一句；{sector_label} 替换本轮实际板块名。必须说清楚加仓/减仓/观望/空仓/不追高/止盈等态度，禁止只说「可关注」。
+"""
+
+_BIAS_BULLISH = ("偏多", "看涨", "看多", "上行")
+_BIAS_BEARISH = ("偏空", "看跌", "看空", "下行")
+_BIAS_NEUTRAL = ("观望", "中性", "震荡", "盘整", "持平")
+
+_SHORT_RE = re.compile(r"^短期[（(]?[^）):：\n]{0,24}[）)]?\s*[:：]\s*(.+)$")
+_MED_RE = re.compile(r"^中期[（(]?[^）):：\n]{0,24}[）)]?\s*[:：]\s*(.+)$")
+
+
+def _classify_bias(text: str) -> str:
+    t = (text or "").strip()
+    for w in _BIAS_BULLISH:
+        if w in t:
+            return "bullish"
+    for w in _BIAS_BEARISH:
+        if w in t:
+            return "bearish"
+    for w in _BIAS_NEUTRAL:
+        if w in t:
+            return "neutral"
+    return "neutral"
+
+
+def _clean_bias_text(text: str) -> str:
+    t = (text or "").strip().rstrip("。；;")
+    for word in ("偏多观察", "偏空观察", "观望"):
+        if word in t:
+            return word
+    for word in ("偏多", "偏空"):
+        if word in t:
+            return word + "观察"
+    return t[:24] if t else "观望"
+
+
+def _parse_outlook_block(lines: list[str]) -> dict[str, str] | None:
+    label = "综合"
+    short_text = ""
+    med_text = ""
+    for line in lines:
+        m_short = _SHORT_RE.match(line)
+        m_med = _MED_RE.match(line)
+        if m_short:
+            short_text = m_short.group(1).strip()
+        elif m_med:
+            med_text = m_med.group(1).strip()
+        elif not short_text and not med_text:
+            label = line
+    if not short_text and not med_text:
+        return None
+    return {
+        "label": label,
+        "short_text": _clean_bias_text(short_text) or "观望",
+        "short_bias": _classify_bias(short_text),
+        "medium_text": _clean_bias_text(med_text) or "观望",
+        "medium_bias": _classify_bias(med_text),
+    }
+
+
+def parse_outlook(text: str) -> tuple[list[dict[str, str]], str]:
+    """Extract outlook cards from reply body; return (items, body_without_outlook_block)."""
+    if not text or OUTLOOK_SECTION_TITLE not in text:
+        return [], text
+
+    start = text.find(OUTLOOK_SECTION_TITLE)
+    before = text[:start].rstrip()
+    rest = text[start + len(OUTLOOK_SECTION_TITLE) :].strip()
+
+    parts = re.split(r"\n\s*\n", rest)
+    items: list[dict[str, str]] = []
+    body_parts: list[str] = []
+
+    for part in parts:
+        chunk = part.strip()
+        if not chunk:
+            continue
+        if "短期" in chunk and "中期" in chunk:
+            lines = [ln.strip() for ln in chunk.split("\n") if ln.strip()]
+            parsed = _parse_outlook_block(lines)
+            if parsed:
+                items.append(parsed)
+                continue
+        body_parts.append(chunk)
+
+    if not items:
+        return [], text
+
+    after = "\n\n".join(body_parts).strip()
+    cleaned = "\n\n".join(p for p in (before, after) if p).strip()
+    return items, cleaned or text
+
+
+def resolve_guidance_sector_label(fetched: dict[str, Any]) -> str:
+    """Pick display label for closing guidance (replace 科技 placeholder)."""
+    matched = [m for m in (fetched.get("matched_sectors") or []) if m not in ("板块", "行业", "主线", "龙头", "题材", "概念")]
+    if matched:
+        return matched[0]
+
+    names: list[str] = []
+    for s in fetched.get("symbols") or []:
+        if not s.get("available"):
+            continue
+        name = (s.get("name") or "").strip()
+        code = (s.get("symbol") or "").split(".")[0]
+        if name and name != code:
+            names.append(name)
+    if names:
+        if len(names) == 1:
+            return names[0]
+        return "、".join(names[:2]) + "等标的"
+
+    workflow = fetched.get("workflow") or ""
+    if workflow in ("sector_deep_dive", "opportunity_scan", "risk_scan"):
+        return "相关主线板块"
+    if workflow == "market_overview":
+        return "市场主线"
+    return "本轮分析板块"
+
+
+def build_guidance_instruction(fetched: dict[str, Any]) -> str:
+    label = resolve_guidance_sector_label(fetched)
+    return GUIDANCE_CLOSING_INSTRUCTION.format(sector_label=label)

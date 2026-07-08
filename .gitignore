@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# 本地密钥（仅提交 .env.example）
+.env
+.env.*
+!.env.example
+.env.loop.llm
+
+# 本地数据库与运行时数据（保留 data/.gitkeep）
+data/*.db
+data/*.sqlite
+portfolio.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# 维护者本地文档（搭建过程，不入公开仓库）
+PRD.md
+DEVELOPMENT.md
+CONTRIBUTING.md
+
+# Skill 构建与审计（产物已在 skills/，用户无需此脚本）
+scripts/build_nison_skills.py
+scripts/nison_rule_compiler.py
+scripts/audit_skill_coverage.py
+sources/
+
+# 开发环境配置（非运行必需）
+ruff.toml
+.python-version
+.github/
+
+# 搭建期自检工具（本地保留，不入公开仓库）
+loop-engine-plugin/
+loop.config.js
+loop.config.generated.js
+loop.llm.config.js
+.loop-engine/
+package.json
+package-lock.json
+e2e/
+playwright.config.js
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# 构建/提取缓存
+.cache/
+scripts/nison_build_report.json
+
+# 原书数据体积大，本地保留即可
+sources/epub/
+sources/**/*.pdf
+sources/epub/ocr/
+
+# 编辑器本地配置（不入库）
+.cursor/
+
+# 系统杂项
+.DS_Store
+Thumbs.db
+*.log
+node_modules/
