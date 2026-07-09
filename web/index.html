@@ -189,20 +189,32 @@
   <div id="settingsModal" class="modal-backdrop">
     <div class="modal-panel max-w-lg">
       <h3 class="text-lg font-medium mb-2">大模型 API 设置</h3>
-      <p class="text-xs text-textSub mb-4">支持 OpenAI 兼容接口（百炼、DeepSeek、自建网关等），配置保存在本地 <code class="text-primary">.env</code></p>
-      <label class="block text-sm text-textSub mb-1">接入方式</label>
-      <select id="providerInput" class="input-clean mb-3">
-        <option value="openai">OpenAI 兼容 API（推荐）</option>
+      <p class="text-xs text-textSub mb-4">支持任意 <strong>OpenAI 兼容</strong> 接口：填写 Base URL、API Key 与模型名即可；配置保存在本地 <code class="text-primary">.env</code></p>
+      <label class="block text-sm text-textSub mb-1">接入类型</label>
+      <select id="connectionTypeInput" class="input-clean mb-3">
+        <option value="api">云端 API（OpenAI 兼容）</option>
+        <option value="ollama">本地 Ollama（无需 Key）</option>
+      </select>
+      <label class="block text-sm text-textSub mb-1">服务商预设 <span class="text-textPlaceholder">（可选，自动填充 URL 与模型）</span></label>
+      <select id="presetInput" class="input-clean mb-3">
+        <option value="custom">自定义</option>
         <option value="bailian">阿里云百炼</option>
+        <option value="deepseek">DeepSeek</option>
+        <option value="openai">OpenAI</option>
+        <option value="moonshot">Moonshot 月之暗面</option>
+        <option value="zhipu">智谱 AI</option>
+        <option value="siliconflow">SiliconFlow</option>
         <option value="ollama">本地 Ollama</option>
       </select>
       <label class="block text-sm text-textSub mb-1">API Base URL</label>
-      <input id="baseUrlInput" class="input-clean mb-3" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1">
-      <label class="block text-sm text-textSub mb-1">API Key</label>
-      <input id="apiKeyInput" type="password" class="input-clean mb-1" placeholder="留空则不修改已有 Key">
-      <p id="apiKeyHint" class="text-xs text-textPlaceholder mb-3"></p>
+      <input id="baseUrlInput" class="input-clean mb-3" placeholder="https://api.deepseek.com/v1">
+      <div id="apiKeySection">
+        <label class="block text-sm text-textSub mb-1">API Key</label>
+        <input id="apiKeyInput" type="password" class="input-clean mb-1" placeholder="sk-...">
+        <p id="apiKeyHint" class="text-xs text-textPlaceholder mb-3"></p>
+      </div>
       <label class="block text-sm text-textSub mb-1">模型名称</label>
-      <input id="modelInput" class="input-clean mb-2" placeholder="deepseek-r1">
+      <input id="modelInput" class="input-clean mb-2" placeholder="deepseek-chat">
       <p id="settingsStatus" class="text-xs text-textSub mb-4 min-h-[1.25rem]"></p>
       <div class="flex justify-between gap-3">
         <button id="testSettings" class="btn-3d btn-3d-white text-sm">测试连接</button>
@@ -236,6 +248,6 @@
   </footer>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-  <script src="/static/app.js?v=21"></script>
+  <script src="/static/app.js?v=22"></script>
 </body>
 </html>

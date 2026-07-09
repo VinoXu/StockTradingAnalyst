@@ -1,6 +1,46 @@
 const LS_SELECTED = 'pp_selected_symbols';
 const LS_SELECTED_EXPLICIT = 'pp_selected_explicit';
 
+/** OpenAI 兼容服务商预设：选后自动填充 URL 与默认模型 */
+const LLM_PRESETS = {
+  custom: { label: '自定义', url: '', model: '' },
+  bailian: {
+    label: '阿里云百炼',
+    url: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    model: 'deepseek-r1',
+  },
+  deepseek: {
+    label: 'DeepSeek',
+    url: 'https://api.deepseek.com/v1',
+    model: 'deepseek-chat',
+  },
+  openai: {
+    label: 'OpenAI',
+    url: 'https://api.openai.com/v1',
+    model: 'gpt-4o-mini',
+  },
+  moonshot: {
+    label: 'Moonshot 月之暗面',
+    url: 'https://api.moonshot.cn/v1',
+    model: 'moonshot-v1-8k',
+  },
+  zhipu: {
+    label: '智谱 AI',
+    url: 'https://open.bigmodel.cn/api/paas/v4',
+    model: 'glm-4-flash',
+  },
+  siliconflow: {
+    label: 'SiliconFlow',
+    url: 'https://api.siliconflow.cn/v1',
+    model: 'deepseek-ai/DeepSeek-V3',
+  },
+  ollama: {
+    label: '本地 Ollama',
+    url: 'http://127.0.0.1:11434',
+    model: 'qwen2.5:7b',
+  },
+};
+
 const views = {
   chat: document.getElementById('view-chat'),
   history: document.getElementById('view-history'),
@@ -414,19 +454,75 @@ function openSettings() {
   loadSettingsForm();
 }
 
+function detectPresetFromSettings(s) {
+  const url = (s.base_url || '').replace(/\/+$/, '');
+  const model = s.model || '';
+  if (s.provider === 'ollama') return 'ollama';
+  for (const [key, preset] of Object.entries(LLM_PRESETS)) {
+    if (key === 'custom') continue;
+    if (key === 'ollama') continue;
+    if (preset.url.replace(/\/+$/, '') === url) return key;
+  }
+  return 'custom';
+}
+
+function applyConnectionType(type, { skipPreset = false } = {}) {
+  const isOllama = type === 'ollama';
+  document.getElementById('apiKeySection').classList.toggle('hidden', isOllama);
+  document.getElementById('presetInput').disabled = isOllama;
+  if (isOllama && !skipPreset) {
+    document.getElementById('presetInput').value = 'ollama';
+    applyPreset('ollama', { skipConnection: true });
+  }
+}
+
+function applyPreset(presetKey, { skipConnection = false } = {}) {
+  const preset = LLM_PRESETS[presetKey];
+  if (!preset) return;
+  if (presetKey === 'ollama') {
+    if (!skipConnection) {
+      document.getElementById('connectionTypeInput').value = 'ollama';
+      applyConnectionType('ollama', { skipPreset: true });
+    }
+  } else if (presetKey !== 'custom') {
+    if (!skipConnection) {
+      document.getElementById('connectionTypeInput').value = 'api';
+      applyConnectionType('api', { skipPreset: true });
+    }
+  }
+  if (preset.url) document.getElementById('baseUrlInput').value = preset.url;
+  if (preset.model) document.getElementById('modelInput').value = preset.model;
+}
+
+function collectSettingsPayload() {
+  const connectionType = document.getElementById('connectionTypeInput').value;
+  const provider = connectionType === 'ollama' ? 'ollama' : 'openai';
+  return {
+    provider,
+    base_url: document.getElementById('baseUrlInput').value.trim(),
+    api_key: document.getElementById('apiKeyInput').value.trim() || null,
+    model: document.getElementById('modelInput').value.trim() || 'deepseek-r1',
+  };
+}
+
 async function loadSettingsForm() {
   try {
     const s = await api('/api/settings');
-    document.getElementById('providerInput').value = s.provider || 'openai';
+    const connectionType = s.provider === 'ollama' ? 'ollama' : 'api';
+    document.getElementById('connectionTypeInput').value = connectionType;
+    applyConnectionType(connectionType);
+    document.getElementById('presetInput').value = detectPresetFromSettings(s);
     document.getElementById('baseUrlInput').value = s.base_url || '';
     document.getElementById('modelInput').value = s.model || 'deepseek-r1';
     document.getElementById('apiKeyInput').value = '';
-    document.getElementById('apiKeyHint').textContent = s.has_key
-      ? `当前 Key：${s.api_key_masked}（留空则不修改）`
-      : '请输入 API Key';
+    document.getElementById('apiKeyHint').textContent = s.provider === 'ollama'
+      ? '本地 Ollama 无需 API Key'
+      : s.has_key
+        ? `当前 Key：${s.api_key_masked}（留空则不修改）`
+        : '请输入 API Key';
     document.getElementById('settingsStatus').textContent = s.llm_ready
       ? `已就绪 · ${s.model}`
-      : '待配置';
+      : '待配置 URL 与 Key';
   } catch (e) {
     document.getElementById('settingsStatus').textContent = e.message;
   }
@@ -972,14 +1068,10 @@ document.getElementById('saveSettings').addEventListener('click', async () => {
   const btn = document.getElementById('saveSettings');
   btn.disabled = true;
   try {
+    const payload = collectSettingsPayload();
     const data = await api('/api/settings', {
       method: 'POST',
-      body: JSON.stringify({
-        provider: document.getElementById('providerInput').value,
-        base_url: document.getElementById('baseUrlInput').value.trim(),
-        api_key: document.getElementById('apiKeyInput').value.trim() || null,
-        model: document.getElementById('modelInput').value.trim() || 'deepseek-r1',
-      }),
+      body: JSON.stringify(payload),
     });
     document.getElementById('settingsStatus').textContent = data.message;
     await loadSettingsForm();
@@ -998,16 +1090,11 @@ document.getElementById('testSettings').addEventListener('click', async () => {
   btn.disabled = true;
   document.getElementById('settingsStatus').textContent = '测试中…';
   try {
-    const key = document.getElementById('apiKeyInput').value.trim();
-    if (key) {
+    const payload = collectSettingsPayload();
+    if (payload.api_key || payload.provider === 'ollama') {
       await api('/api/settings', {
         method: 'POST',
-        body: JSON.stringify({
-          provider: document.getElementById('providerInput').value,
-          base_url: document.getElementById('baseUrlInput').value.trim(),
-          api_key: key,
-          model: document.getElementById('modelInput').value.trim() || 'deepseek-r1',
-        }),
+        body: JSON.stringify(payload),
       });
     }
     const data = await api('/api/settings/test', { method: 'POST' });
@@ -1022,11 +1109,12 @@ document.getElementById('testSettings').addEventListener('click', async () => {
   }
 });
 
-document.getElementById('providerInput').addEventListener('change', () => {
-  const p = document.getElementById('providerInput').value;
-  const base = document.getElementById('baseUrlInput');
-  if (p === 'bailian') base.value = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
-  else if (p === 'ollama') base.value = 'http://127.0.0.1:11434';
+document.getElementById('connectionTypeInput').addEventListener('change', (e) => {
+  applyConnectionType(e.target.value);
+});
+
+document.getElementById('presetInput').addEventListener('change', (e) => {
+  applyPreset(e.target.value);
 });
 
 document.getElementById('inlineAddStock').addEventListener('click', async () => {

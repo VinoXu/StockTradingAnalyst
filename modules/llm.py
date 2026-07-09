@@ -1,4 +1,4 @@
-"""LLM bridge: Alibaba Bailian (DeepSeek-R1) or local Ollama."""
+"""LLM bridge: OpenAI-compatible APIs (URL + Key) or local Ollama."""
 
 from __future__ import annotations
 
@@ -381,5 +381,7 @@ def generate_portfolio_advice(
 def llm_setup_hint() -> str:
     cfg = llm_config()
     if cfg["provider"] == "ollama":
-        return f"Ollama {cfg['model']}"
-    return f"{cfg['model']}"
+        return f"Ollama · {cfg['model']}"
+    base = cfg.get("base_url") or ""
+    host = base.replace("https://", "").replace("http://", "").split("/")[0]
+    return f"{cfg['model']} @ {host}" if host else str(cfg["model"])

@@ -60,11 +60,10 @@ def main() -> None:
             symbol = sys.argv[i + 1]
     scope = "symbol" if symbol else "portfolio"
 
-    cfg = llm_config()
     if not llm_available():
         raise SystemExit(
-            "LLM 未就绪。百炼请在 .env 配置 DASHSCOPE_API_KEY；"
-            "Ollama 请运行 ollama serve。"
+            "LLM 未就绪。请在 .env 或 Web「API 设置」中配置 LLM_BASE_URL + LLM_API_KEY；"
+            "本地 Ollama 请运行 ollama serve。"
         )
 
     no_skills = "--no-skills" in sys.argv

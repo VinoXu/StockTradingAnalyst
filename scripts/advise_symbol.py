@@ -7,7 +7,7 @@ Usage:
     python scripts/advise_symbol.py 600000 --json
 
 Environment:
-    .env 中配置 DASHSCOPE_API_KEY（百炼 DeepSeek-R1，默认）
+    .env 中配置 LLM_BASE_URL + LLM_API_KEY + LLM_MODEL（任意 OpenAI 兼容 API）
     或 LLM_PROVIDER=ollama + OLLAMA_HOST / OLLAMA_MODEL
 """
 
@@ -50,7 +50,7 @@ def main() -> None:
     if "--agent" in sys.argv:
         if not llm_available():
             raise SystemExit(
-                "LLM 未就绪。请在 .env 配置 DASHSCOPE_API_KEY，或启动 Ollama。"
+                "LLM 未就绪。请在 .env 或 Web「API 设置」中配置 LLM_BASE_URL + LLM_API_KEY，或启动 Ollama。"
             )
         try:
             print(generate_murphy_advice(symbol, conversational=True))

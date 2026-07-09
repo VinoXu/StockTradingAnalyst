@@ -52,40 +52,70 @@ def _mask_key(key: str) -> str:
 def read_api_key_masked() -> str:
     load_env()
     reload_env()
-    key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or os.environ.get("DASHSCOPE_API_KEY", "")
-    return _mask_key(key)
+    return _mask_key(_resolve_api_key())
 
 
-def read_settings() -> dict[str, str | bool]:
-    load_env()
-    reload_env()
-    provider = os.environ.get("LLM_PROVIDER", "openai").strip().lower() or "openai"
-    if provider in ("bailian", "dashscope", "百炼"):
-        provider = "bailian"
-    elif provider in ("ollama", "local"):
-        provider = "ollama"
-    else:
-        provider = "openai"
+def _normalize_provider(raw: str) -> str:
+    prov = (raw or "openai").strip().lower()
+    if prov in ("bailian", "dashscope", "百炼"):
+        return "bailian"
+    if prov in ("ollama", "local"):
+        return "ollama"
+    return "openai"
 
-    key = os.environ.get("LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or os.environ.get("DASHSCOPE_API_KEY", "")
-    base = (
+
+def _infer_provider_from_url(base_url: str) -> str:
+    url = (base_url or "").strip().lower()
+    if "dashscope.aliyuncs.com" in url:
+        return "bailian"
+    return "openai"
+
+
+def _resolve_base_url() -> str:
+    return (
         os.environ.get("LLM_BASE_URL")
         or os.environ.get("OPENAI_BASE_URL")
         or os.environ.get("DASHSCOPE_BASE_URL")
         or "https://dashscope.aliyuncs.com/compatible-mode/v1"
     )
-    model = (
+
+
+def _resolve_model() -> str:
+    return (
         os.environ.get("LLM_MODEL")
         or os.environ.get("OPENAI_MODEL")
         or os.environ.get("DASHSCOPE_MODEL")
         or "deepseek-r1"
     )
+
+
+def _resolve_api_key() -> str:
+    return (
+        os.environ.get("LLM_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("DASHSCOPE_API_KEY")
+        or ""
+    )
+
+
+def read_settings() -> dict[str, str | bool]:
+    load_env()
+    reload_env()
+    explicit = os.environ.get("LLM_PROVIDER", "openai").strip().lower() or "openai"
+    provider = _normalize_provider(explicit)
+    key = _resolve_api_key()
+    if provider == "ollama":
+        base = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+        model = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
+    else:
+        base = _resolve_base_url()
+        model = _resolve_model()
     return {
         "provider": provider,
         "api_key_masked": _mask_key(key),
         "base_url": base,
         "model": model,
-        "has_key": bool(key),
+        "has_key": bool(key) if provider != "ollama" else True,
     }
 
 
@@ -96,28 +126,25 @@ def save_llm_settings(
     base_url: str | None = None,
     model: str = "deepseek-r1",
 ) -> str:
-    existing = (
-        os.environ.get("LLM_API_KEY")
-        or os.environ.get("OPENAI_API_KEY")
-        or os.environ.get("DASHSCOPE_API_KEY")
-        or ""
-    )
+    existing = _resolve_api_key()
     key = (api_key or "").strip()
     if not key or key.startswith("（") or "..." in key:
         key = existing
-    if provider != "ollama" and not key:
-        return "请输入有效的 API Key"
 
-    prov = (provider or "openai").strip().lower()
-    if prov in ("bailian", "dashscope"):
-        prov = "bailian"
-    elif prov in ("ollama", "local"):
-        prov = "ollama"
-    else:
-        prov = "openai"
-
-    url = (base_url or "").strip() or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    prov = _normalize_provider(provider)
+    url = (base_url or "").strip()
     mdl = (model or "deepseek-r1").strip()
+
+    if prov == "ollama":
+        url = url or "http://127.0.0.1:11434"
+        mdl = mdl or "qwen2.5:7b"
+    else:
+        url = url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        mdl = mdl or "deepseek-r1"
+        if prov == "openai":
+            prov = _infer_provider_from_url(url)
+        if not key:
+            return "请输入有效的 API Key"
 
     lines: list[str] = []
     if ENV_PATH.is_file():
@@ -137,18 +164,24 @@ def save_llm_settings(
                 f"LLM_API_KEY={key}",
                 f"LLM_BASE_URL={url}",
                 f"LLM_MODEL={mdl}",
-                f"DASHSCOPE_API_KEY={key}",
-                f"DASHSCOPE_BASE_URL={url}",
-                f"DASHSCOPE_MODEL={mdl}",
             ]
         )
+        if prov == "bailian":
+            lines.extend(
+                [
+                    f"DASHSCOPE_API_KEY={key}",
+                    f"DASHSCOPE_BASE_URL={url}",
+                    f"DASHSCOPE_MODEL={mdl}",
+                ]
+            )
 
     ENV_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
     reload_env()
     from modules.chat_service import reset_session
 
     reset_session()
-    return f"已保存（{prov} · {mdl}）"
+    label = "Ollama" if prov == "ollama" else "OpenAI 兼容"
+    return f"已保存（{label} · {mdl}）"
 
 
 def save_api_key(api_key: str | None, model: str = "deepseek-r1") -> str:
