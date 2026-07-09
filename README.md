@@ -6,6 +6,12 @@
 
 > GitHub 仓库名可能为 `StockTradingAnalyst`，与产品名 Profit Protector 指同一项目。
 
+## 界面预览
+
+本地 Web 对话界面：左侧导航（新建对话 / 历史 / 自选股 / API 设置），中间为 AI 投研问答，底部可勾选标的并一键问大盘、风险板块、机会板块。
+
+![Profit Protector 对话界面](docs/images/chat-ui.png)
+
 ## 目录结构
 
 ```text
