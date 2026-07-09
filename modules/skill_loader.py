@@ -5,6 +5,7 @@ Only reads whitelisted ``skills/`` under the project root.
 
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +46,11 @@ def skill_path(name: str) -> Path:
 
 def load_skill(name: str) -> str:
     """Return full Skill text — sole source of judgment rules at runtime."""
+    return _load_skill_cached(name)
+
+
+@lru_cache(maxsize=16)
+def _load_skill_cached(name: str) -> str:
     path = skill_path(name)
     if not path.is_file():
         raise FileNotFoundError(path)

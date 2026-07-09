@@ -52,9 +52,6 @@ const chatEmpty = document.getElementById('chatEmpty');
 const inputBottom = document.getElementById('inputBottom');
 const sendBtn = document.getElementById('sendBtn');
 const loadingBar = document.getElementById('loadingBar');
-const analyzingBanner = document.getElementById('analyzingBanner');
-const analyzingStatusText = document.getElementById('analyzingStatusText');
-const cancelChatBtn = document.getElementById('cancelChatBtn');
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
 const selectedSummary = document.getElementById('selectedSummary');
@@ -78,6 +75,8 @@ let analyzingStartedAt = 0;
 let tradingHours = false;
 let livePollTimer = null;
 let typingEl = null;
+let streamRow = null;
+let streamBubble = null;
 let currentSessionId = null;
 let loadedSessionId = null;
 const chartInstances = new Map();
@@ -287,7 +286,7 @@ function appendBubble(role, text, { noScroll = false, charts = null, timeBanner 
     bubble.className = 'bubble-user';
   } else if (role === 'typing') {
     bubble.className = 'bubble-typing';
-    bubble.innerHTML = '<i class="fa fa-circle-o-notch fa-spin mr-2"></i>正在分析，请稍候…';
+    bubble.innerHTML = formatTypingBubbleHtml('正在分析，请稍候…');
   } else {
     bubble.className = 'bubble-ai';
   }
@@ -368,6 +367,117 @@ function removeTyping() {
     typingEl.remove();
     typingEl = null;
   }
+}
+
+function formatTypingBubbleHtml(hint) {
+  return (
+    '<span class="typing-dots" aria-hidden="true"><span></span><span></span><span></span></span>'
+    + `<span class="typing-hint">${escapeHtml(hint)}</span>`
+  );
+}
+
+function updateTypingBubble(hint) {
+  if (!typingEl) return;
+  const bubble = typingEl.querySelector('.bubble-typing');
+  if (bubble) bubble.innerHTML = formatTypingBubbleHtml(hint);
+}
+
+function removeStreamBubble() {
+  if (streamRow) {
+    streamRow.remove();
+    streamRow = null;
+    streamBubble = null;
+  }
+}
+
+function beginStreamBubble() {
+  if (streamRow) return;
+  removeTyping();
+  streamRow = appendBubble('assistant', '');
+  streamBubble = streamRow.querySelector('.bubble-ai');
+}
+
+function appendStreamDelta(text) {
+  if (!text) return;
+  beginStreamBubble();
+  if (streamBubble) {
+    streamBubble.textContent += text;
+    scrollChatBottom();
+  }
+}
+
+function finalizeStreamBubble(data) {
+  removeTyping();
+  removeStreamBubble();
+  appendBubble('assistant', data.body || data.reply, {
+    charts: data.charts,
+    timeBanner: data.time_banner,
+    outlook: data.outlook || [],
+  });
+}
+
+async function consumeChatStream(msg) {
+  const res = await fetch('/api/chat/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal: chatAbortController.signal,
+    body: JSON.stringify({
+      message: msg,
+      symbols: selected,
+      session_id: currentSessionId,
+    }),
+  });
+
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const detail = data.detail;
+    throw new Error(typeof detail === 'string' ? detail : data.error || res.statusText);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let doneData = null;
+  let errorData = null;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const parts = buf.split('\n\n');
+    buf = parts.pop() || '';
+    for (const part of parts) {
+      const line = part.trim();
+      if (!line.startsWith('data:')) continue;
+      let ev;
+      try {
+        ev = JSON.parse(line.slice(5).trim());
+      } catch {
+        continue;
+      }
+      if (ev.event === 'phase') {
+        /* 保持 analyzingHint 动态文案；phase 仅用于内部状态 */
+      } else if (ev.event === 'delta') {
+        appendStreamDelta(ev.text || '');
+      } else if (ev.event === 'done') {
+        doneData = ev.data;
+      } else if (ev.event === 'error') {
+        errorData = ev;
+      }
+    }
+  }
+
+  if (errorData) {
+    removeStreamBubble();
+    removeTyping();
+    return errorData;
+  }
+  if (doneData?.ok) {
+    finalizeStreamBubble(doneData);
+    return doneData;
+  }
+  removeStreamBubble();
+  throw new Error('流式响应未完成');
 }
 
 async function initChatSession() {
@@ -808,26 +918,17 @@ function analyzingHint(elapsedSec) {
 function updateAnalyzingUI() {
   if (!sending) return;
   const elapsed = Math.floor((Date.now() - analyzingStartedAt) / 1000);
-  const hint = analyzingHint(elapsed);
-  if (analyzingStatusText) analyzingStatusText.textContent = hint;
-  if (typingEl) {
-    const bubble = typingEl.querySelector('.bubble-typing');
-    if (bubble) {
-      bubble.innerHTML = `<i class="fa fa-circle-o-notch fa-spin mr-2"></i>${hint}`;
-    }
-  }
+  updateTypingBubble(analyzingHint(elapsed));
 }
 
 function startAnalyzingUI() {
   analyzingStartedAt = Date.now();
-  analyzingBanner?.classList.remove('hidden');
   updateAnalyzingUI();
   if (analyzingTimer) clearInterval(analyzingTimer);
   analyzingTimer = setInterval(updateAnalyzingUI, 1000);
 }
 
 function stopAnalyzingUI() {
-  analyzingBanner?.classList.add('hidden');
   if (analyzingTimer) {
     clearInterval(analyzingTimer);
     analyzingTimer = null;
@@ -891,23 +992,16 @@ async function sendMessage(text, { market = false } = {}) {
   inputBottom.style.height = 'auto';
 
   chatAbortController = new AbortController();
-  setLoading(true);
   showTyping();
+  setLoading(true);
 
   try {
-    const data = await api('/api/chat', {
-      method: 'POST',
-      signal: chatAbortController.signal,
-      body: JSON.stringify({
-        message: msg,
-        symbols: selected,
-        session_id: currentSessionId,
-      }),
-    });
-    removeTyping();
+    const data = await consumeChatStream(msg);
     if (!data.ok) {
       chatTurns.pop();
       chatMessages.lastElementChild?.remove();
+      removeStreamBubble();
+      removeTyping();
       inputBottom.value = msg;
       toast(data.error || '请求失败', 'error');
       if (data.need_settings) openSettings();
@@ -925,13 +1019,9 @@ async function sendMessage(text, { market = false } = {}) {
     if (data.session_id) currentSessionId = data.session_id;
     loadedSessionId = null;
     applyContextStatus(data);
-    appendBubble('assistant', data.body || data.reply, {
-      charts: data.charts,
-      timeBanner: data.time_banner,
-      outlook: data.outlook || [],
-    });
   } catch (e) {
     removeTyping();
+    removeStreamBubble();
     if (e.name === 'AbortError') {
       const note = '已停止本次分析。你可以修改问题后重新发送；若刚停不久又收到重复回复，忽略即可。';
       appendBubble('assistant', note);
@@ -955,7 +1045,6 @@ sendBtn.addEventListener('click', () => {
   if (sending) cancelChatRequest();
   else sendMessage();
 });
-cancelChatBtn?.addEventListener('click', cancelChatRequest);
 inputBottom.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();

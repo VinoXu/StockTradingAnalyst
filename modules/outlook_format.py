@@ -8,7 +8,7 @@ from typing import Any
 OUTLOOK_SECTION_TITLE = "【观点结论】"
 
 OUTLOOK_INSTRUCTION = """
-回答涉及具体标的/个股/ETF 分析时，在正文展开之前必须先输出「观点结论」块，格式如下（纯文本，禁止 Markdown）：
+回答涉及具体标的/个股/ETF 分析时，在正文展开之前必须先输出「观点结论」块（纯文本）：
 
 【观点结论】
 （若多只标的，每只一段，先写名称或代码）
@@ -16,19 +16,14 @@ OUTLOOK_INSTRUCTION = """
 中期（1～2周）：偏多观察 / 偏空观察 / 观望 三选一
 
 要求：
-1. 「短期」「中期」两行必须各出现且只能三选一用词
+1. 结论须体现 Skill 推断（不仅是现状）：如「偏多观察」要暗示趋势/形态依据
 2. 禁止用买入/卖出，只用偏多观察、偏空观察、观望
-3. 写完观点结论块后空一行，再写分析正文
+3. 写完观点结论块后空一行，再写正文（机会路径 + 潜在风险 + 证伪条件）
 4. 大盘/纯板块问题可省略此块
 """
 
 GUIDANCE_CLOSING_INSTRUCTION = """
-正文写完后，最后用 1～2 句直接说仓位态度（不要加小标题，不要写「指导建议」「口诀」「批语」）：
-例：指数靠权重股撑着、多数个股在跌，建议轻仓观望，{sector_label}冲高就减仓，别加仓。
-例：盘面偏强、资金有承接，可以小仓位关注{sector_label}，不追涨。
-例：指数像诱多、个股跟不上，建议减仓，{sector_label}别新开仓。
-例：跌得凶、承接弱，建议减仓或空仓，先别碰{sector_label}。
-按本轮盘面选最接近的一句；{sector_label} 替换本轮实际板块名。必须说清楚加仓/减仓/观望/空仓/不追高/止盈等态度，禁止只说「可关注」。
+（已由 analysis_mandate 按 workflow 动态生成，此处保留兼容。）
 """
 
 _BIAS_BULLISH = ("偏多", "看涨", "看多", "上行")
@@ -149,5 +144,6 @@ def resolve_guidance_sector_label(fetched: dict[str, Any]) -> str:
 
 
 def build_guidance_instruction(fetched: dict[str, Any]) -> str:
-    label = resolve_guidance_sector_label(fetched)
-    return GUIDANCE_CLOSING_INSTRUCTION.format(sector_label=label)
+    from modules.analysis_mandate import build_closing_guidance
+
+    return build_closing_guidance(fetched)

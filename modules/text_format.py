@@ -18,6 +18,37 @@ _JARGON_PHRASES = (
 )
 
 
+def humanize_stream_display(text: str) -> str:
+    """Strip markdown during streaming; no paragraph reflow (safe on partial text)."""
+    if not text:
+        return text
+
+    t = text.replace("\r\n", "\n")
+    for _ in range(4):
+        t = re.sub(r"\*\*(.+?)\*\*", r"\1", t, flags=re.DOTALL)
+        t = re.sub(r"\*(.+?)\*", r"\1", t, flags=re.DOTALL)
+    t = t.replace("**", "").replace("*", "")
+    t = re.sub(r"`([^`\n]*)`?", r"\1", t)
+    t = re.sub(r"^#{1,6}\s+", "", t, flags=re.MULTILINE)
+    t = re.sub(r"^---+\s*$", "", t, flags=re.MULTILINE)
+
+    out_lines: list[str] = []
+    for raw in t.split("\n"):
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            out_lines.append("")
+            continue
+        if stripped.startswith(("- ", "* ", "+ ")):
+            line = line[: len(line) - len(line.lstrip())] + stripped[2:].strip()
+        elif re.match(r"^\d+\.\s+", stripped):
+            prefix = line[: len(line) - len(line.lstrip())]
+            line = prefix + re.sub(r"^\d+\.\s+", "", stripped)
+        line = line.replace("•", "").replace("·", "")
+        out_lines.append(line)
+    return "\n".join(out_lines)
+
+
 def humanize_reply(text: str) -> str:
     """Strip markdown artifacts; keep readable spoken Chinese."""
     if not text:

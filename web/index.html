@@ -46,7 +46,18 @@
       .icon-btn-slim { @apply w-9 h-9 rounded-xl flex items-center justify-center text-textSub hover:bg-primaryBg hover:text-primary transition-all cursor-pointer border border-transparent hover:border-primary/20; }
       .bubble-ai { @apply bg-white border border-blockBorder text-textMain rounded-2xl rounded-tl-md px-4 py-3 text-sm leading-relaxed shadow-flat; }
       .bubble-user { @apply bg-gradient-to-br from-primaryLight to-primary text-white rounded-2xl rounded-tr-md px-4 py-3 text-sm leading-relaxed shadow-btn3d; }
-      .bubble-typing { @apply bubble-ai text-textPlaceholder italic; }
+      .bubble-typing { @apply bubble-ai text-textPlaceholder italic flex items-center gap-2; }
+      .typing-dots { display: inline-flex; gap: 4px; align-items: center; flex-shrink: 0; }
+      .typing-dots span {
+        width: 6px; height: 6px; border-radius: 50%; background: #86909C;
+        animation: typingDot 1.4s infinite ease-in-out both;
+      }
+      .typing-dots span:nth-child(2) { animation-delay: 0.16s; }
+      .typing-dots span:nth-child(3) { animation-delay: 0.32s; }
+      @keyframes typingDot {
+        0%, 80%, 100% { opacity: 0.35; transform: scale(0.85); }
+        40% { opacity: 1; transform: scale(1); }
+      }
       .history-item { @apply p-4 border border-blockBorder rounded-xl hover:border-primary hover:bg-primaryBg/30 transition-all; }
       .stock-row { @apply flex items-center gap-3 py-3 px-3 border border-blockBorder rounded-xl mb-2 hover:shadow-flat transition-all bg-white; }
       .modal-backdrop {
@@ -172,12 +183,6 @@
           <span id="contextLimitText" class="flex-1 leading-relaxed"></span>
           <button type="button" id="contextLimitNewChat" class="btn-3d btn-3d-primary text-sm py-2 px-3 whitespace-nowrap flex-shrink-0">新建对话</button>
         </div>
-        <div id="analyzingBanner" class="hidden flex items-center justify-between gap-3 px-4 py-3 rounded-xl border border-primary/20 bg-primary/5 text-sm text-textMain">
-          <span id="analyzingStatusText" class="flex-1 leading-relaxed">正在分析，请稍候…</span>
-          <button type="button" id="cancelChatBtn" class="btn-3d btn-3d-white text-sm py-2 px-3 whitespace-nowrap flex-shrink-0 text-fall border-fall/30">
-            <i class="fa fa-stop-circle"></i> 停止分析
-          </button>
-        </div>
         <div class="flex gap-3 items-end">
           <textarea id="inputBottom" rows="2" class="input-clean flex-1 resize-y min-h-[52px] max-h-[200px] leading-relaxed" placeholder="输入问题，Enter 发送，Shift+Enter 换行"></textarea>
           <button id="sendBtn" class="send-btn-3d"><i class="fa fa-paper-plane text-lg"></i></button>
@@ -248,6 +253,6 @@
   </footer>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-  <script src="/static/app.js?v=22"></script>
+  <script src="/static/app.js?v=25"></script>
 </body>
 </html>

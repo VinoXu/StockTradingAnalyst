@@ -7,11 +7,9 @@ import logging
 # (question, answer) pairs before the current turn
 Turn = tuple[str, str]
 
-MAX_VERBATIM_TURNS = 3
-MAX_ANSWER_CHARS = 600
-MAX_TOTAL_CHARS = 5000
 MAX_SUMMARY_CHARS = 400
 SUMMARY_INPUT_ANSWER_CHARS = 800
+MEMORY_BLOCK_LIMIT = 800
 
 logger = logging.getLogger(__name__)
 
@@ -149,33 +147,15 @@ def build_memory_block(
     prior_turns: list[Turn],
     session_summary: str = "",
 ) -> tuple[str, bool]:
-    """Format prior dialogue for injection; returns (block, was_truncated)."""
+    """Inject session summary only. Caller must ensure summary when prior turns exist."""
     summary = (session_summary or "").strip()
-    if not prior_turns and not summary:
+    if not summary:
         return "", False
 
-    verbatim_n = 2 if summary else MAX_VERBATIM_TURNS
-    recent = prior_turns[-verbatim_n:] if prior_turns else []
-
-    lines = ["【对话记忆】"]
-    if summary:
-        lines.append(f"本 session 历史提炼：{summary}")
-    if recent:
-        label = "最近往来：" if summary else "以下是本 session 内更早的往来："
-        lines.append(label)
-        for q, a in recent:
-            body = _strip_time_banner(a)
-            a_short = body if len(body) <= MAX_ANSWER_CHARS else body[:MAX_ANSWER_CHARS] + "…"
-            lines.append(f"用户：{q}")
-            lines.append(f"助手：{a_short}")
-    elif not summary and len(prior_turns) > verbatim_n:
-        old = prior_turns[:-verbatim_n]
-        lines.append(f"更早对话摘要：{_rule_summarize_old(old)}")
-
-    block = "\n".join(lines)
-    was_truncated = len(block) > MAX_TOTAL_CHARS
+    block = f"【对话记忆】\n本 session 历史提炼：{summary}"
+    was_truncated = len(block) > MEMORY_BLOCK_LIMIT
     if was_truncated:
-        block = block[:MAX_TOTAL_CHARS] + "…（记忆已截断）"
+        block = block[:MEMORY_BLOCK_LIMIT] + "…（记忆已截断）"
     return block, was_truncated
 
 
@@ -183,33 +163,28 @@ NEW_CHAT_HINT = "本对话上下文已达上限，请点击「新建对话」开
 
 
 def _session_raw_chars(prior_turns: list[Turn], session_summary: str = "") -> int:
-    """Estimate cumulative session footprint (what must be remembered across turns)."""
-    total = len((session_summary or "").strip())
-    for q, a in prior_turns:
-        body = _strip_time_banner(a)
-        total += len(q) + min(len(body), MAX_ANSWER_CHARS)
-    return total
+    return len((session_summary or "").strip())
 
 
 def assess_context_limit(
     prior_turns: list[Turn],
     session_summary: str = "",
 ) -> dict[str, int | bool | str | None]:
-    """Check whether session context has hit the memory cap."""
+    """Check whether session summary memory is too large."""
     if not prior_turns:
         return {
             "context_full": False,
             "context_chars": 0,
-            "context_limit": MAX_TOTAL_CHARS,
+            "context_limit": MEMORY_BLOCK_LIMIT,
             "new_chat_hint": None,
         }
 
     raw_chars = _session_raw_chars(prior_turns, session_summary)
-    block, was_truncated = build_memory_block(prior_turns, session_summary=session_summary)
-    context_full = was_truncated or raw_chars >= MAX_TOTAL_CHARS
+    _block, was_truncated = build_memory_block(prior_turns, session_summary=session_summary)
+    context_full = was_truncated or raw_chars >= MEMORY_BLOCK_LIMIT
     return {
         "context_full": context_full,
         "context_chars": raw_chars,
-        "context_limit": MAX_TOTAL_CHARS,
+        "context_limit": MEMORY_BLOCK_LIMIT,
         "new_chat_hint": NEW_CHAT_HINT if context_full else None,
     }

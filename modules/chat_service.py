@@ -2,30 +2,45 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from typing import Any
+
+from modules.analysis_mandate import CORE_ANALYSIS_MANDATE
 from modules.chart_builder import build_charts
 from modules.chat_history import (
     append_turn,
     clear_all,
     create_session,
     ensure_active_session,
+    ensure_session_summary,
     get_session_summary,
     load_session_raw_turns,
     load_session_ui_turns,
+    refresh_session_summary_async,
     set_active_session,
 )
+from modules.context_guard import assess_payload, trim_fetched_aggressive
 from modules.conversation_memory import assess_context_limit, build_memory_block
+from modules.cot_prompt import build_cot_instruction, strip_cot_leakage
 from modules.data_timestamps import collect_reference_meta, format_time_banner
-from modules.llm import build_chat_session_messages, chat, llm_available
+from modules.llm import build_chat_system_prompt, chat, chat_stream, llm_available
 from modules.outlook_format import (
     OUTLOOK_INSTRUCTION,
     OUTLOOK_SECTION_TITLE,
     build_guidance_instruction,
     parse_outlook,
 )
-from modules.query_planner import fetch_data_for_plan, format_fetch_block, format_sector_pick_hint, plan_query
-from modules.text_format import humanize_reply
+from modules.query_planner import (
+    compact_payload_for_llm,
+    fetch_data_for_plan,
+    format_fetch_block,
+    format_sector_pick_hint,
+    plan_query,
+)
+from modules.skill_mapper import select_skills_for_plan, skills_summary
+from modules.text_format import humanize_reply, humanize_stream_display
+from modules.ui_log import log_ui_event
 
-_sessions: dict[str, dict] = {}
 _ui_turns: dict[str, list[dict[str, str]]] = {}
 _raw_turns: dict[str, list[tuple[str, str]]] = {}
 
@@ -45,21 +60,45 @@ def _resolve_session_id(session_id: str | None) -> str:
     return str(int(session_id))
 
 
-def _ensure_session(session_id: str, selected: list[str]) -> dict:
-    scope, symbol, symbols = _resolve_scope(selected)
-    key = (scope, symbol, tuple(symbols or ()))
-    state = _sessions.get(session_id, {})
-    if state.get("ready") and state.get("ctx_key") == key:
-        return state
-    messages = build_chat_session_messages(
-        scope=scope,
-        symbol=symbol,
-        symbols=symbols,
-        include_skills=True,
+def _scope_note(scope: str, symbol: str | None, symbols: list[str] | None) -> str:
+    if scope == "open":
+        return (
+            "用户未勾选分析标的。请根据每轮用户消息中的检索数据作答；"
+            "若问哪个板块看好，开头第一句直接点名板块。"
+        )
+    if scope == "symbol" and symbol:
+        return f"当前聚焦单标的：{symbol}。"
+    if scope == "portfolio" and symbols:
+        return f"用户已勾选分析标的：{', '.join(symbols)}。"
+    return "当前为组合/持仓分析 scope。"
+
+
+def _build_llm_messages(
+    *,
+    effective: list[str],
+    plan,
+    memory_block: str,
+    fetched: dict,
+    message: str,
+) -> list[dict[str, str]]:
+    """Rebuild LLM messages each turn: system(skills) + one compact user blob."""
+    scope, symbol, symbols = _resolve_scope(effective)
+    skill_names = select_skills_for_plan(plan, scope=scope)
+    system = build_chat_system_prompt(
+        skill_names=skill_names,
+        scope_note=_scope_note(scope, symbol, symbols),
     )
-    state = {"ready": True, "ctx_key": key, "messages": messages}
-    _sessions[session_id] = state
-    return state
+    compact = compact_payload_for_llm(fetched)
+    llm_user = _compose_user_message(message, memory_block=memory_block, fetched=compact)
+    llm_user = (
+        f"【本轮 Skill】{skills_summary(skill_names)}\n\n{llm_user}"
+        if skill_names
+        else llm_user
+    )
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": llm_user},
+    ]
 
 
 def hydrate_session_from_db(session_id: str) -> None:
@@ -69,20 +108,17 @@ def hydrate_session_from_db(session_id: str) -> None:
 
 
 def reset_llm_context(session_id: str | None = None) -> None:
-    """Clear LLM message state only; keep DB-backed turn memory."""
-    sid = _resolve_session_id(session_id)
-    _sessions.pop(sid, None)
+    """Web chat rebuilds LLM payload per turn; nothing to clear in memory."""
+    return
 
 
 def reset_session(session_id: str | None = None) -> None:
     """Clear all in-memory state for one session."""
     if session_id:
         sid = _resolve_session_id(session_id)
-        _sessions.pop(sid, None)
         _ui_turns.pop(sid, None)
         _raw_turns.pop(sid, None)
         return
-    _sessions.clear()
     _ui_turns.clear()
     _raw_turns.clear()
 
@@ -138,35 +174,34 @@ def activate_session(session_id: int) -> dict:
 
 _WORKFLOW_HINTS: dict[str, str] = {
     "market_overview": (
-        "【工作流·大盘环境】用户未勾选标的，问题聚焦市场整体。"
-        "请用 market 数据说明指数、广度与成交额，再针对性回答，不要逐个分析自选股。"
+        "【工作流·大盘环境】从 Skill（趋势/广度/量价）推断：接下来大盘更可能延续还是转折；"
+        "点 1～2 个受益或受损的主线方向，不要只报指数涨跌。"
     ),
     "sector_deep_dive": (
-        "【工作流·板块拆解】用户未勾选标的，问题涉及板块/行业。"
-        "请从 sectors 中匹配问题相关板块（见 matched_sectors），说明涨跌、领涨股与资金特征；"
-        "可结合 market 环境；不要写成自选股点评。"
+        "【工作流·板块拆解】对照 Skill 拆解 matched_sectors："
+        "趋势阶段、形态位置、量价是否配合；给出「若延续则…」「若失败则…」两条路径。"
     ),
     "risk_scan": (
-        "【工作流·风险扫描】用户关注回调/风险。"
-        "结合 market 广度与 sectors.top_losers 说明承压板块与逻辑，给出风险观察。"
+        "【工作流·风险扫描】用 Skill 找尚未兑现的高概率风险：假突破、背离、胀爆、支撑失守；"
+        "说明触发信号与建议降仓条件，不要等跌完再事后解释。"
     ),
     "opportunity_scan": (
-        "【工作流·板块形态优选】用户问哪个板块看好。"
-        "系统已遍历行业+概念板块，并按领涨股股价形态、趋势、板块广度综合评分（见 sector_picks，不是单纯涨幅排序）。"
-        "第一句话直接点名评分最高的1～3个板块，用形态/趋势说理由；不要只讲今日涨跌幅，不要绕弯。"
+        "【工作流·机会挖掘】用户要机会/加仓方向。"
+        "必须基于 sector_picks（形态+趋势+广度，非单纯涨幅）点名 1～3 个板块，"
+        "每个板块说：为何可能继续、最佳参与方式（顺势/回踩）、证伪条件。"
+        "结构配合时禁止一味说别追高；要说怎么参与才合理。"
     ),
     "capital_flow": (
-        "【工作流·资金】用户关注资金流向。"
-        "结合 market、sectors 与 symbols（若有）说明资金特征，禁止编造北向/主力数据。"
+        "【工作流·资金】从量价与资金面 Skill 推断资金是「持续流入可能延续」还是「拉高出货」；"
+        "给出后续 3～5 日的观察点，禁止编造北向/主力明细。"
     ),
     "named_symbols": (
-        "【工作流·点名标的】用户问题中点名了代码/名称。"
-        "请重点分析 symbols 数据；可简要带一句市场环境。"
+        "【工作流·点名标的】对照 Skill 逐条核对 symbols/summary："
+        "多周期趋势、形态、振荡指标；给短期路径与失效条件。"
     ),
     "question_deep_dive": (
-        "【工作流·问题驱动】用户未勾选任何标的。"
-        "请先拆解问题意图，从 market 与 sectors 中匹配相关板块与数据，再深度回答；"
-        "不要分析用户自选股列表，除非问题中明确点名某只股票/代码。"
+        "【工作流·问题驱动】先答用户真正要什么（机会还是风险），"
+        "再从 market/sectors 中匹配数据，用 Skill 做 forward 推断，禁止行情复述充字数。"
     ),
 }
 
@@ -198,7 +233,7 @@ def _compose_user_message(
     memory_block: str,
     fetched: dict,
 ) -> str:
-    parts: list[str] = []
+    parts: list[str] = [CORE_ANALYSIS_MANDATE, build_cot_instruction(fetched)]
     if memory_block:
         parts.append(memory_block)
 
@@ -251,6 +286,21 @@ def _compose_user_message(
     pick_hint = format_sector_pick_hint(fetched.get("sector_picks") or {})
     if pick_hint:
         parts.append(pick_hint)
+    pf = fetched.get("participant_flow") or {}
+    if pf.get("northbound", {}).get("available"):
+        nb = pf["northbound"]
+        net = nb.get("total_net_buy")
+        net_s = f"{net:,.0f}" if net is not None else "—"
+        parts.append(
+            f"【北向资金·全市场】{nb.get('trade_date', '')} 北向合计净买 {net_s}。"
+            "须结合内资大小单结构判断内外资是否分歧。"
+        )
+    matched_flow = pf.get("sector_fund_flow_matched") or []
+    if matched_flow:
+        lines = ["【板块主力净流入·匹配】"]
+        for row in matched_flow[:6]:
+            lines.append(f"- {row.get('name')}：{row.get('main_net_inflow', 0):,.0f}")
+        parts.append("\n".join(lines))
     candle_hint = _format_candle_bars_hint(fetched)
     if candle_hint:
         parts.append(candle_hint)
@@ -259,12 +309,11 @@ def _compose_user_message(
     parts.append(
         "【用户问题】\n"
         f"{message}\n\n"
-        "请基于对话记忆与本轮检索数据回答；"
-        "语言要简单直白、短句连贯，像跟朋友聊股票；"
-        "禁止生造词、绕口令、文艺腔，禁止「手语/批语/口诀/落地指导/化作可操作」等表述；"
-        "若 live_quote 有盘中价，先报现价与涨跌；技术指标仍按日K截止日说明；"
-        "禁止 Markdown 符号；需要看走势时不必画 ASCII 图，系统会在界面自动配图；"
-        "全文最后 1～2 句直接写加仓/减仓/观望/空仓等态度，不要另起小标题。"
+        "请基于 Skill 判据 + 本轮检索数据 + 对话记忆回答；"
+        "必须给出向前看的趋势/机会判断与尚未兑现的风险，不要当行情播报；"
+        "语言简单直白；禁止 Markdown；"
+        "若 live_quote 有盘中价先报现价；技术指标说明日K截止日；"
+        "全文最后按【收尾态度】给出可执行的仓位观点。"
         + (f"\n{sector_hint}" if sector_hint else "")
     )
     return "\n\n".join(parts)
@@ -297,7 +346,7 @@ def _strip_llm_time_preamble(text: str) -> str:
 def _finalize_reply(raw: str, symbols: list[str]) -> tuple[str, dict, str, str, list[dict[str, str]]]:
     meta = collect_reference_meta(symbols)
     time_banner = format_time_banner(meta)
-    body_raw = _strip_llm_time_preamble(humanize_reply(raw))
+    body_raw = _strip_llm_time_preamble(humanize_reply(strip_cot_leakage(raw)))
     outlook, body = parse_outlook(body_raw)
     reply_body = body
     if outlook:
@@ -322,15 +371,17 @@ def _should_attach_charts(plan, effective: list[str]) -> bool:
     return False
 
 
-def ask(
+def _prepare_ask_llm(
     message: str,
     *,
     symbols: list[str],
-    session_id: str = "default",
-) -> dict:
+    session_id: str,
+    append_user_turn: bool = True,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Validate session + build LLM messages. Returns (error, context)."""
     message = (message or "").strip()
     if not message:
-        return {"ok": False, "error": "请输入问题"}
+        return {"ok": False, "error": "请输入问题"}, None
 
     sid = _resolve_session_id(session_id)
     set_active_session(int(sid))
@@ -344,13 +395,16 @@ def ask(
             "ok": False,
             "error": "大模型未配置。请点击左下角「API 设置」填写 API Key 后重试。",
             "need_settings": True,
-        }
+        }, None
 
     if sid not in _raw_turns:
         hydrate_session_from_db(sid)
 
     prior = list(_raw_turns.get(sid, []))
-    session_summary = get_session_summary(int(sid))
+    if prior:
+        session_summary = ensure_session_summary(int(sid), prior_turns=prior)
+    else:
+        session_summary = get_session_summary(int(sid))
     ctx_before = assess_context_limit(prior, session_summary=session_summary)
     if ctx_before["context_full"]:
         return {
@@ -358,69 +412,219 @@ def ask(
             "error": ctx_before["new_chat_hint"],
             "need_new_chat": True,
             **ctx_before,
-        }
+        }, None
 
     turns = _ui_turns.setdefault(sid, [])
-    turns.append({"role": "user", "content": message})
+    if append_user_turn:
+        turns.append({"role": "user", "content": message})
+
+    plan = plan_query(message, user_selected)
+    fetched = fetch_data_for_plan(
+        plan,
+        None if no_selection else user_selected,
+    )
+
+    memory_block, _memory_truncated = build_memory_block(prior, session_summary=session_summary)
+    messages = _build_llm_messages(
+        effective=effective,
+        plan=plan,
+        memory_block=memory_block,
+        fetched=fetched,
+        message=message,
+    )
+    preflight = assess_payload(messages)
+    payload_trimmed = False
+    if preflight["payload_blocked"]:
+        before_chars = preflight["payload_chars"]
+        trimmed_fetch = trim_fetched_aggressive(fetched)
+        messages = _build_llm_messages(
+            effective=effective,
+            plan=plan,
+            memory_block=memory_block,
+            fetched=trimmed_fetch,
+            message=message,
+        )
+        preflight = assess_payload(messages)
+        payload_trimmed = preflight["payload_chars"] < before_chars
+
+    skill_names = select_skills_for_plan(plan, scope=_resolve_scope(effective)[0])
+    log_ui_event(
+        "context_preflight",
+        detail={
+            "payload_chars": preflight.get("payload_chars"),
+            "payload_limit": preflight.get("payload_limit"),
+            "payload_warned": preflight.get("payload_warned"),
+            "payload_blocked": preflight.get("payload_blocked"),
+            "payload_trimmed": payload_trimmed,
+            "skills": list(skill_names),
+        },
+        session_id=sid,
+    )
+
+    if preflight["payload_blocked"]:
+        if append_user_turn and turns and turns[-1].get("role") == "user":
+            turns.pop()
+        return {
+            "ok": False,
+            "error": preflight.get("payload_hint"),
+            "payload_chars": preflight.get("payload_chars"),
+            "payload_limit": preflight.get("payload_limit"),
+            "need_new_chat": True,
+        }, None
+
+    return None, {
+        "sid": sid,
+        "message": message,
+        "effective": effective,
+        "prior": prior,
+        "turns": turns,
+        "plan": plan,
+        "messages": messages,
+        "preflight": preflight,
+        "payload_trimmed": payload_trimmed,
+        "skill_names": skill_names,
+    }
+
+
+def _complete_ask_turn(ctx: dict[str, Any], raw_reply: str) -> dict[str, Any]:
+    """Persist assistant turn and return API payload."""
+    sid = ctx["sid"]
+    message = ctx["message"]
+    effective = ctx["effective"]
+    plan = ctx["plan"]
+    preflight = ctx["preflight"]
+    skill_names = ctx["skill_names"]
+    payload_trimmed = ctx["payload_trimmed"]
+    turns = ctx["turns"]
+
+    reply, meta, time_banner, body, outlook = _finalize_reply(raw_reply, effective)
+
+    charts = []
+    if _should_attach_charts(plan, effective):
+        chart_syms = plan.symbols or effective
+        charts = build_charts(chart_syms, plan.chart_kinds or ["price"])
+
+    turns.append(
+        {
+            "role": "assistant",
+            "content": body,
+            "timeBanner": time_banner,
+            "fullReply": reply,
+            "charts": charts,
+            "outlook": outlook,
+        }
+    )
+
+    raw_list = _raw_turns.setdefault(sid, [])
+    raw_list.append((message, reply))
+
+    append_turn(int(sid), message, reply)
+    refresh_session_summary_async(int(sid))
+    ctx_after = _session_context_status(sid)
+    return {
+        "ok": True,
+        "reply": reply,
+        "body": body,
+        "time_banner": time_banner,
+        "outlook": outlook,
+        "question": message,
+        "session_id": sid,
+        **ctx_after,
+        "data_reference": meta,
+        "charts": charts,
+        "plan": {
+            "keywords": plan.keywords,
+            "intents": plan.intents,
+            "symbols": plan.symbols or effective,
+            "workflow": plan.workflow,
+            "skills": list(skill_names),
+        },
+        "payload_chars": preflight.get("payload_chars"),
+        "payload_limit": preflight.get("payload_limit"),
+        "payload_warned": preflight.get("payload_warned"),
+        "payload_trimmed": payload_trimmed,
+        "turns": get_ui_turns(sid),
+    }
+
+
+def ask_stream_events(
+    message: str,
+    *,
+    symbols: list[str],
+    session_id: str = "default",
+) -> Iterator[dict[str, Any]]:
+    """SSE event generator: phase → preflight → delta* → done | error."""
+    err, ctx = _prepare_ask_llm(
+        message,
+        symbols=symbols,
+        session_id=session_id,
+        append_user_turn=True,
+    )
+    if err:
+        yield {"event": "error", **err}
+        return
+
+    yield {
+        "event": "phase",
+        "phase": "preparing",
+        "skills": list(ctx["skill_names"]),
+        "workflow": ctx["plan"].workflow,
+    }
+    yield {
+        "event": "preflight",
+        "payload_chars": ctx["preflight"].get("payload_chars"),
+        "payload_limit": ctx["preflight"].get("payload_limit"),
+        "payload_warned": ctx["preflight"].get("payload_warned"),
+        "payload_trimmed": ctx["payload_trimmed"],
+    }
 
     try:
-        state = _ensure_session(sid, effective)
+        yield {"event": "phase", "phase": "streaming"}
+        chunks: list[str] = []
+        display_sent = ""
+        for delta in chat_stream(ctx["messages"], temperature=0.25):
+            chunks.append(delta)
+            display = humanize_stream_display(strip_cot_leakage("".join(chunks)))
+            if len(display) < len(display_sent):
+                display_sent = ""
+            piece = display[len(display_sent) :]
+            display_sent = display
+            if piece:
+                yield {"event": "delta", "text": piece}
 
-        memory_block, _memory_truncated = build_memory_block(prior, session_summary=session_summary)
+        raw_reply = "".join(chunks).strip()
+        if not raw_reply:
+            raise RuntimeError("模型返回空内容")
 
-        plan = plan_query(message, user_selected)
-        fetched = fetch_data_for_plan(
-            plan,
-            None if no_selection else user_selected,
-        )
-
-        llm_user = _compose_user_message(message, memory_block=memory_block, fetched=fetched)
-        state["messages"].append({"role": "user", "content": llm_user})
-
-        raw_reply = chat(state["messages"], temperature=0.25)
-        reply, meta, time_banner, body, outlook = _finalize_reply(raw_reply, effective)
-
-        charts = []
-        if _should_attach_charts(plan, effective):
-            chart_syms = plan.symbols or effective
-            charts = build_charts(chart_syms, plan.chart_kinds or ["price"])
-
-        state["messages"].append({"role": "assistant", "content": reply})
-        turns.append(
-            {
-                "role": "assistant",
-                "content": body,
-                "timeBanner": time_banner,
-                "fullReply": reply,
-                "charts": charts,
-                "outlook": outlook,
-            }
-        )
-
-        raw_list = _raw_turns.setdefault(sid, [])
-        raw_list.append((message, reply))
-
-        append_turn(int(sid), message, reply)
-        ctx_after = _session_context_status(sid)
-        return {
-            "ok": True,
-            "reply": reply,
-            "body": body,
-            "time_banner": time_banner,
-            "outlook": outlook,
-            "question": message,
-            "session_id": sid,
-            **ctx_after,
-            "data_reference": meta,
-            "charts": charts,
-            "plan": {
-                "keywords": plan.keywords,
-                "intents": plan.intents,
-                "symbols": plan.symbols or effective,
-            },
-            "turns": get_ui_turns(sid),
-        }
+        result = _complete_ask_turn(ctx, raw_reply)
+        yield {"event": "done", "data": result}
     except Exception as exc:  # noqa: BLE001
+        turns = ctx["turns"]
+        if turns and turns[-1].get("role") == "user":
+            turns.pop()
+        yield {"event": "error", "ok": False, "error": str(exc)}
+
+
+def ask(
+    message: str,
+    *,
+    symbols: list[str],
+    session_id: str = "default",
+) -> dict:
+    err, ctx = _prepare_ask_llm(
+        message,
+        symbols=symbols,
+        session_id=session_id,
+        append_user_turn=True,
+    )
+    if err:
+        return err
+
+    try:
+        raw_reply = chat(ctx["messages"], temperature=0.25)
+        return _complete_ask_turn(ctx, raw_reply)
+    except Exception as exc:  # noqa: BLE001
+        turns = ctx["turns"]
         if turns and turns[-1].get("role") == "user":
             turns.pop()
         return {"ok": False, "error": str(exc)}
@@ -457,6 +661,9 @@ def sync_symbols(codes: list[str]) -> dict:
     msg = " · ".join(lines) if lines else "同步失败"
     if errors:
         msg += "；失败：" + " · ".join(errors)
+    from modules.runtime_cache import invalidate_prefix
+
+    invalidate_prefix("data:")
     reset_llm_context()
     return {"ok": ok, "message": msg}
 

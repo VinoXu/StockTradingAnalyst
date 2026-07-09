@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from modules.app_config import read_api_key_masked, read_settings, save_llm_settings
@@ -14,6 +15,7 @@ from modules.chat_history import delete_session, load_messages, load_sessions
 from modules.chat_service import (
     activate_session,
     ask,
+    ask_stream_events,
     clear_history,
     create_new_chat_session,
     get_current_session_info,
@@ -158,10 +160,65 @@ def chat_api(req: ChatReq) -> dict[str, Any]:
     result = ask(req.message, symbols=req.symbols, session_id=req.session_id)
     log_ui_event(
         "chat_end",
-        detail={"ok": result.get("ok"), "error": result.get("error")},
+        detail={
+            "ok": result.get("ok"),
+            "error": result.get("error"),
+            "payload_chars": result.get("payload_chars"),
+            "payload_limit": result.get("payload_limit"),
+            "payload_warned": result.get("payload_warned"),
+            "payload_trimmed": result.get("payload_trimmed"),
+            "skills": (result.get("plan") or {}).get("skills"),
+        },
         session_id=req.session_id,
     )
     return result
+
+
+@app.post("/api/chat/stream")
+def chat_stream_api(req: ChatReq) -> StreamingResponse:
+    log_ui_event(
+        "chat_start",
+        detail={"message_len": len(req.message or ""), "symbols": req.symbols, "stream": True},
+        session_id=req.session_id,
+    )
+
+    def event_gen():
+        final: dict[str, Any] | None = None
+        for ev in ask_stream_events(req.message, symbols=req.symbols, session_id=req.session_id):
+            if ev.get("event") == "done":
+                final = ev.get("data") or {}
+            elif ev.get("event") == "error":
+                final = ev
+            yield f"data: {json.dumps(ev, ensure_ascii=False, default=str)}\n\n"
+
+        if final:
+            if final.get("event") == "error" or final.get("ok") is False:
+                log_ui_event(
+                    "chat_end",
+                    detail={"ok": False, "error": final.get("error"), "stream": True},
+                    session_id=req.session_id,
+                )
+            else:
+                log_ui_event(
+                    "chat_end",
+                    detail={
+                        "ok": True,
+                        "error": None,
+                        "stream": True,
+                        "payload_chars": final.get("payload_chars"),
+                        "payload_limit": final.get("payload_limit"),
+                        "payload_warned": final.get("payload_warned"),
+                        "payload_trimmed": final.get("payload_trimmed"),
+                        "skills": (final.get("plan") or {}).get("skills"),
+                    },
+                    session_id=req.session_id,
+                )
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/session/current")

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+import threading
 from datetime import datetime, timedelta, timezone
 
 from modules.conversation_memory import build_session_summary
 from modules.db import get_connection, init_db
+
+logger = logging.getLogger(__name__)
 
 RETENTION_DAYS = 30
 ACTIVE_SESSION_KEY = "active_chat_session_id"
@@ -190,17 +194,52 @@ def load_session_ui_turns(session_id: int) -> list[dict]:
     return turns
 
 
-def update_session_summary(session_id: int) -> None:
-    turns = load_session_raw_turns(session_id)
-    previous = get_session_summary(session_id)
-    summary = build_session_summary(turns, previous_summary=previous)
+def save_session_summary(session_id: int, summary: str) -> None:
+    init_db()
     now = _now()
     with get_connection() as conn:
         conn.execute(
             "UPDATE chat_sessions SET summary = ?, updated_at = ? WHERE id = ?",
-            (summary, now, session_id),
+            (summary.strip(), now, session_id),
         )
         conn.commit()
+
+
+def ensure_session_summary(
+    session_id: int,
+    prior_turns: list[tuple[str, str]] | None = None,
+) -> str:
+    """Return session summary; generate synchronously when prior turns exist but summary is empty."""
+    existing = get_session_summary(session_id)
+    if existing:
+        return existing
+    turns = prior_turns if prior_turns is not None else load_session_raw_turns(session_id)
+    if not turns:
+        return ""
+    summary = build_session_summary(turns, previous_summary="")
+    save_session_summary(session_id, summary)
+    return summary
+
+
+def update_session_summary(session_id: int) -> str:
+    turns = load_session_raw_turns(session_id)
+    previous = get_session_summary(session_id)
+    summary = build_session_summary(turns, previous_summary=previous)
+    save_session_summary(session_id, summary)
+    return summary
+
+
+def refresh_session_summary_async(session_id: int) -> None:
+    """Background refresh after a completed turn (does not block chat response)."""
+
+    def _run() -> None:
+        try:
+            update_session_summary(session_id)
+            logger.info("session summary refreshed: session_id=%s", session_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("async session summary failed session_id=%s: %s", session_id, exc)
+
+    threading.Thread(target=_run, daemon=True, name=f"summary-{session_id}").start()
 
 
 def append_turn(session_id: int, user_msg: str, assistant_msg: str) -> None:
@@ -229,7 +268,6 @@ def append_turn(session_id: int, user_msg: str, assistant_msg: str) -> None:
             (now, session_id),
         )
         conn.commit()
-    update_session_summary(session_id)
 
 
 def load_sessions() -> list[dict[str, str | int]]:

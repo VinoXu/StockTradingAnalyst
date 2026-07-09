@@ -6,7 +6,7 @@ import json
 import os
 import urllib.error
 import urllib.request
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 from modules.advisor import build_agent_prompt, build_chat_context
 from modules.env_loader import load_env
@@ -21,25 +21,29 @@ DEFAULT_OLLAMA_MODEL = "qwen2.5:7b"
 DEFAULT_BAILIAN_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_BAILIAN_MODEL = "deepseek-r1"
 
-CHAT_SYSTEM = """你是墨菲《金融市场技术分析》风格的 A 股投研助手。像跟朋友微信聊股票一样回答：简单、直白、好懂。
+CHAT_SYSTEM = """你是墨菲《金融市场技术分析》风格的 A 股投研助手。核心任务：**挖掘趋势与机会、预警尚未兑现的风险**——不是当行情播报员。
 
-文风（最重要）：
-1. 用日常口语短句，一段话说清楚一件事；禁止绕口令、生造词、文艺腔、接口话术
-2. 禁止出现「手语」「批语」「口诀」「落地指导」「化作可操作」「可参考如下」等元话术或小标题
-3. 全文连贯：先讲大盘/环境背景，再讲板块或个股，再讲风险，最后 1～2 句直接说仓位态度；不要东一句西一句
-3a. 用户问「哪个板块看好/推荐/有机会」时：第一句话必须直接说出 1～3 个板块名称；理由必须基于股价形态和趋势（见 sector_picks.pick_reason），不是单纯说今天涨得多；禁止只列回避板块、禁止先讲大盘绕弯
-4. 能用「涨了不少」「多数股票在跌」就别写「冰火对冲」「裂筋态度」这类拗口比喻
+价值标准（最重要）：
+1. 向前看：用 Skill 判据推断「接下来可能发生什么」，给出触发条件与证伪条件（若…则…；若…则观点作废）
+2. 机会优先于复述：用户问机会/加仓/板块时，必须先给 1～3 个**具体方向**及 Skill 依据（形态、趋势、量价、多周期），再讲风险
+3. 风险要前置但未发生：指出假突破、背离、广度失真、胀爆等**概率升高的隐患**，不要等跌完了才说
+4. 禁止只陈述「今天涨 X%、跌 Y 家」当全文结论；数据是证据，不是答案
+5. 结构配合时可以说：顺势参与、分批加仓、回调低吸、提高仓位至 X 成（须给条件）；结构不配合才强调观望减仓
+
+文风：
+1. 日常口语短句，像跟朋友聊股票；禁止绕口令、文艺腔、接口话术
+2. 禁止「手语」「批语」「口诀」「落地指导」「可参考如下」等元话术
+3. 全文连贯：环境约束 → 机会与趋势（Skill 依据）→ 潜在风险 → 最后 1～2 句仓位态度
+4. 用户问哪个板块有机会：第一句直接点名板块，理由来自 sector_picks.pick_reason / 形态趋势，不是单纯今日涨幅
 
 输出格式：
-1. 纯中文口语，禁止 Markdown：不要用 **、##、---、- 列表、编号列表、表格、代码块
-2. 禁止 ASCII 艺术图；需要展示走势时文字描述即可，界面会自动配图
-3. 开头说明数据时间：若 live_quote 存在则先说盘中价与抓取时刻；技术指标仍说明日K截止日
-4. 涉及具体标的分析时，必须先给「观点结论」：短期（1～3个交易日）与中期（1～2周）各标明偏多观察、偏空观察或观望；然后再展开正文
-5. 正文结束后，最后 1～2 句直接写操作建议（如轻仓观望、逢高减仓、不新开仓），含板块或标的指向；不要另起标题，不要复述「以下是建议」
-6. 缺数据就说「这块还没验证到」，禁止编造
-7. 可用加仓、减仓、空仓、观望、低吸、止盈等词，但禁止具体价位与「买入/卖出」下单指令
+1. 纯中文口语，禁止 Markdown（无 **、##、列表、表格）
+2. 开头说明数据时间：live_quote 报盘中价；技术指标说明日K截止日
+3. 具体标的须先给「观点结论」：短期（1～3 日）与中期（1～2 周）各用偏多观察/偏空观察/观望
+4. 缺数据说「这块还没验证到」，禁止编造
+5. 禁止具体价位与「买入/卖出」下单指令；禁止「必涨」「保证收益」
 
-分析依据：系统消息 Skill 判据 + 用户消息中的「对话记忆」「本轮检索数据」；环境优先于个股。
+分析依据：Skill 判据 + 本轮检索数据 + 对话记忆；Skill 是推断规则，不是装饰。
 """
 
 
@@ -153,18 +157,8 @@ def _http_json(
         raise RuntimeError(f"无法连接 LLM 服务：{exc}") from exc
 
 
-def _chat_openai_compatible(
-    messages: list[dict[str, str]],
-    *,
-    model: str | None = None,
-    temperature: float = 0.35,
-    timeout: float = 600.0,
-) -> str:
-    api_key, base, default_model = openai_config()
-    if not api_key:
-        raise RuntimeError("未配置 API Key。请在 API 设置中填写。")
-
-    model = model or default_model
+def _prepare_openai_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Merge system chunks into first user message for OpenAI-compatible APIs."""
     out_messages: list[dict[str, str]] = []
     system_chunks: list[str] = []
     for msg in messages:
@@ -184,6 +178,22 @@ def _chat_openai_compatible(
             out_messages.insert(0, {"role": "user", "content": prefix})
     elif system_chunks:
         out_messages = [{"role": "user", "content": "\n\n".join(system_chunks)}]
+    return out_messages
+
+
+def _chat_openai_compatible(
+    messages: list[dict[str, str]],
+    *,
+    model: str | None = None,
+    temperature: float = 0.35,
+    timeout: float = 600.0,
+) -> str:
+    api_key, base, default_model = openai_config()
+    if not api_key:
+        raise RuntimeError("未配置 API Key。请在 API 设置中填写。")
+
+    model = model or default_model
+    out_messages = _prepare_openai_messages(messages)
 
     payload: dict[str, Any] = {
         "model": model,
@@ -208,6 +218,73 @@ def _chat_openai_compatible(
     if not text:
         raise RuntimeError(f"模型返回空 content：{data!r}")
     return text
+
+
+def _iter_openai_sse_lines(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    headers: dict[str, str],
+    timeout: float,
+) -> Iterator[str]:
+    """Yield text deltas from OpenAI-compatible SSE stream."""
+    payload = {**payload, "stream": True}
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                piece = delta.get("content")
+                if piece:
+                    yield piece
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"LLM HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"无法连接 LLM 服务：{exc}") from exc
+
+
+def _chat_openai_compatible_stream(
+    messages: list[dict[str, str]],
+    *,
+    model: str | None = None,
+    temperature: float = 0.35,
+    timeout: float = 600.0,
+) -> Iterator[str]:
+    api_key, base, default_model = openai_config()
+    if not api_key:
+        raise RuntimeError("未配置 API Key。请在 API 设置中填写。")
+
+    model = model or default_model
+    out_messages = _prepare_openai_messages(messages)
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": out_messages,
+        "temperature": temperature,
+    }
+    yield from _iter_openai_sse_lines(
+        f"{base}/chat/completions",
+        payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        timeout=timeout,
+    )
 
 
 def _chat_bailian(
@@ -250,6 +327,72 @@ def _chat_ollama(
     return text
 
 
+def _chat_ollama_stream(
+    messages: list[dict[str, str]],
+    *,
+    model: str | None = None,
+    host: str | None = None,
+    temperature: float = 0.35,
+    timeout: float = 600.0,
+) -> Iterator[str]:
+    base, default_model = ollama_config()
+    base = (host or base).rstrip("/")
+    model = model or default_model
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "options": {"temperature": temperature},
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base}/api/chat",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            for raw_line in resp:
+                if not raw_line.strip():
+                    continue
+                try:
+                    data = json.loads(raw_line.decode("utf-8"))
+                except json.JSONDecodeError:
+                    continue
+                piece = (data.get("message") or {}).get("content") or ""
+                if piece:
+                    yield piece
+                if data.get("done"):
+                    break
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"LLM HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"无法连接 LLM 服务：{exc}") from exc
+
+
+def chat_stream(
+    messages: list[dict[str, str]],
+    *,
+    model: str | None = None,
+    host: str | None = None,
+    temperature: float = 0.35,
+    timeout: float = 600.0,
+) -> Iterator[str]:
+    """Stream chat tokens from OpenAI-compatible / Bailian / Ollama."""
+    provider = get_provider()
+    if provider == "ollama":
+        yield from _chat_ollama_stream(
+            messages, model=model, host=host, temperature=temperature, timeout=timeout
+        )
+        return
+    yield from _chat_openai_compatible_stream(
+        messages, model=model, temperature=temperature, timeout=timeout
+    )
+
+
 def chat(
     messages: list[dict[str, str]],
     *,
@@ -281,43 +424,53 @@ def generate(
     return chat(messages, model=model, host=host, temperature=temperature, timeout=timeout)
 
 
+def build_chat_system_prompt(
+    *,
+    skill_names: tuple[str, ...] | list[str] | None = None,
+    scope_note: str = "",
+) -> str:
+    """System prompt: style rules + selected Skill criteria only (no heavy JSON)."""
+    names = tuple(skill_names) if skill_names else runtime_skill_names()
+    parts = [CHAT_SYSTEM]
+    if scope_note:
+        parts.extend(["", scope_note])
+    if names:
+        parts.append("\n# Skill 判据（本轮相关，运行时唯一依据）")
+        for name in names:
+            parts.append(f"\n## {name}\n{load_skill(name)}")
+    return "\n".join(parts)
+
+
 def build_chat_session_messages(
     *,
     scope: str = "portfolio",
     symbol: str | None = None,
     symbols: list[str] | None = None,
     include_skills: bool = True,
+    skill_names: tuple[str, ...] | list[str] | None = None,
 ) -> list[dict[str, str]]:
-    ctx = build_chat_context(scope=scope, symbol=symbol, symbols=symbols)
-    from modules.data_timestamps import collect_reference_meta
+    """CLI multi-turn opener; Web chat rebuilds per turn via build_chat_system_prompt."""
+    if scope == "open":
+        scope_note = (
+            "用户未勾选分析标的。请根据每轮用户消息中的检索数据作答；"
+            "若问哪个板块看好，开头第一句直接点名板块。"
+        )
+    elif scope == "symbol" and symbol:
+        scope_note = f"当前聚焦单标的：{symbol}。"
+    elif scope == "portfolio" and symbols:
+        scope_note = f"用户已勾选分析标的：{', '.join(symbols)}。"
+    else:
+        scope_note = "当前为组合/持仓分析 scope。"
 
-    ref_meta = collect_reference_meta(
-        [symbol] if scope == "symbol" and symbol else (symbols or [])
-    )
-    ctx["data_reference"] = ref_meta
-    parts = [CHAT_SYSTEM, "", "# 当前结构化数据", "```json", json.dumps(ctx, ensure_ascii=False, indent=2, default=str), "```"]
-
-    if include_skills:
-        parts.append("\n# Skill 判据（运行时唯一依据）")
-        for name in runtime_skill_names():
-            parts.append(f"\n## {name}\n{load_skill(name)}")
-
-    system_content = "\n".join(parts)
+    skills = tuple(skill_names) if skill_names else (runtime_skill_names() if include_skills else ())
+    system_content = build_chat_system_prompt(skill_names=skills, scope_note=scope_note)
     opener = (
         "请用对话体简要介绍：当前环境、组合/标的整体判断、最该优先关注的 2～3 点。"
         if scope == "portfolio"
         else f"请用对话体简要介绍 {symbol} 当前技术状态与最该关注的 2～3 点。"
+        if scope == "symbol"
+        else "已就绪。请根据后续每轮检索数据与用户问题作答。"
     )
-    if scope == "open":
-        opener = (
-            "用户未勾选分析标的。后续请根据其提问匹配板块（sectors）与市场（market）数据作答。"
-            "若问哪个板块看好，开头第一句直接点名板块，不要绕弯。"
-        )
-    if scope == "portfolio" and symbols:
-        opener = (
-            f"用户已勾选分析标的：{', '.join(symbols)}。"
-            "后续默认以这些标的为主作答；仅在用户明确问大盘/板块时再展开环境。"
-        )
     return [
         {"role": "system", "content": system_content},
         {"role": "user", "content": opener},

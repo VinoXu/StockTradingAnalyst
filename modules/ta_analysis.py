@@ -366,76 +366,39 @@ def analyze_volume_price(s: Snapshot) -> dict[str, Any]:
     }
 
 
-def analyze_capital_flow(symbol: str) -> dict[str, Any]:
-    symbol = _normalize_symbol(symbol)
-    with get_connection() as conn:
-        row = conn.execute(
-            """
-            SELECT * FROM capital_flow
-            WHERE symbol = ?
-            ORDER BY trade_date DESC
-            LIMIT 1
-            """,
-            (symbol,),
-        ).fetchone()
+def analyze_capital_flow(symbol: str, *, price_change_pct: float | None = None) -> dict[str, Any]:
+    """Capital flow with large/small order structure and behavior tags."""
+    from modules.participant_flow import analyze_participant_structure, ensure_symbol_capital_flow
 
-    if not row:
+    sym = _normalize_symbol(symbol)
+    probe = analyze_participant_structure(sym, price_change_pct=price_change_pct)
+    if probe.get("available"):
+        notes = probe.get("notes") or []
         return {
-            "bias": "neutral",
-            "notes": ["无本地资金面数据，请先 sync 或等待接口可用"],
-            "invalidation": "数据缺失",
-            "available": False,
+            **probe,
+            "notes": notes,
+            "note": "；".join(notes)[:500] if notes else "",
         }
 
-    r = dict(row)
-    notes: list[str] = []
-    bias = "neutral"
-    main = r.get("main_net_inflow")
-    if main is not None:
-        if main > 0:
-            bias = "bullish"
-            notes.append(f"主力净流入 {main:,.0f}")
-        elif main < 0:
-            bias = "bearish"
-            notes.append(f"主力净流出 {abs(main):,.0f}")
-
-    streak = 0
-    with get_connection() as conn:
-        streak_rows = conn.execute(
-            """
-            SELECT main_net_inflow FROM capital_flow
-            WHERE symbol = ? ORDER BY trade_date DESC LIMIT 30
-            """,
-            (symbol,),
-        ).fetchall()
-    for sr in streak_rows:
-        if sr["main_net_inflow"] is None or sr["main_net_inflow"] <= 0:
-            break
-        streak += 1
-    if streak >= 3:
-        notes.append(f"连续 {streak} 日主力净流入")
-
-    if r.get("northbound_hold_ratio") is not None:
-        notes.append(f"北向持股占比 {r['northbound_hold_ratio']:.2f}%")
-    if r.get("margin_balance") is not None:
-        notes.append(f"融资余额 {r['margin_balance']:,.0f}")
-    if r.get("on_lhb"):
-        notes.append("近期登上龙虎榜")
-
-    if not notes:
-        notes.append("资金面记录存在但关键字段为空")
+    online = ensure_symbol_capital_flow(sym)
+    if online.get("status") == "ok":
+        probe = analyze_participant_structure(sym, price_change_pct=price_change_pct)
+        if probe.get("available"):
+            notes = probe.get("notes") or []
+            return {
+                **probe,
+                "notes": notes,
+                "note": "；".join(notes)[:500] if notes else "",
+            }
 
     return {
-        "bias": bias,
-        "main_net_inflow": main,
-        "streak_days": streak,
-        "northbound_hold_ratio": r.get("northbound_hold_ratio"),
-        "margin_balance": r.get("margin_balance"),
-        "on_lhb": bool(r.get("on_lhb")),
-        "trade_date": r.get("trade_date"),
-        "notes": notes,
-        "invalidation": "East Money 估算口径；接口失败或涨停日失真",
-        "available": True,
+        "bias": "neutral",
+        "notes": [
+            "无本地资金面数据，在线拉取失败或接口不可用",
+            f"详情：{online.get('error', '请先 sync_symbol')}",
+        ],
+        "invalidation": "数据缺失",
+        "available": False,
     }
 
 

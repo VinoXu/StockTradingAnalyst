@@ -11,7 +11,11 @@ from modules.advisor import collect_analysis, collect_market_context, summarize_
 from modules.data_fetcher import _normalize_symbol
 from modules.data_timestamps import _now_label, collect_reference_meta, symbol_data_as_of
 from modules.portfolio import get_holding, list_holdings
+from modules.runtime_cache import get_or_set
 from modules.sector_data import build_sector_pick_summary, collect_sector_rankings
+
+_SECTOR_CACHE_TTL = 120.0
+_MARKET_CACHE_TTL = 60.0
 
 _CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
 
@@ -266,17 +270,55 @@ def fetch_data_for_plan(plan: QueryPlan, fallback_symbols: list[str] | None = No
     if not plan.portfolio_focus and (plan.needs_market or plan.sector_only or not symbols):
         from modules.realtime_quotes import get_live_quote
 
-        market = collect_market_context(refresh_breadth=plan.sector_only or plan.needs_market)
+        refresh_breadth = plan.sector_only or plan.needs_market
+        cache_key = f"data:market:{'breadth' if refresh_breadth else 'basic'}"
+        market = get_or_set(
+            cache_key,
+            _MARKET_CACHE_TTL,
+            lambda: collect_market_context(refresh_breadth=refresh_breadth),
+        )
         index_live = get_live_quote("INDEX.SH000001")
         if index_live and index_live.get("available"):
+            market = dict(market)
             market["index_live"] = index_live
         payload["market"] = market
 
     if plan.needs_sectors:
-        sectors = collect_sector_rankings()
+        sectors = get_or_set(
+            "data:sector_rankings",
+            _SECTOR_CACHE_TTL,
+            collect_sector_rankings,
+        )
         payload["sectors"] = sectors
         if plan.wants_sector_pick:
-            payload["sector_picks"] = build_sector_pick_summary(sectors)
+            payload["sector_picks"] = get_or_set(
+                "data:sector_picks",
+                _SECTOR_CACHE_TTL,
+                lambda: build_sector_pick_summary(sectors),
+            )
+
+    needs_participant = (
+        plan.needs_sectors
+        or plan.needs_market
+        or plan.sector_only
+        or "capital_flow" in plan.intents
+        or plan.wants_sector_pick
+    )
+    if needs_participant:
+        from modules.participant_flow import collect_market_participant_context
+
+        # 仅用具体板块名匹配资金流；泛化意图词（如「概念」「板块」）会误命中大量板块
+        _flow_kw_skip = frozenset({
+            "板块", "行业", "主线", "龙头", "题材", "概念", "机会", "风险", "利好", "上涨",
+            "突破", "潜力", "看好", "推荐", "值得关注", "强势", "资金", "流入", "流出",
+            "北向", "主力", "融资", "龙虎榜", "回调", "利空", "下跌", "破位",
+        })
+        kws = [
+            k
+            for k in dict.fromkeys((plan.matched_sectors or []) + (plan.keywords or []))
+            if k and len(k) >= 2 and k not in _flow_kw_skip
+        ]
+        payload["participant_flow"] = collect_market_participant_context(sector_keywords=kws)
 
     if symbols and not plan.sector_only:
         from modules.realtime_quotes import attach_live_to_symbol_payload, get_live_quotes
@@ -299,8 +341,9 @@ def format_sector_pick_hint(picks: dict[str, Any]) -> str:
     """Plain-text hint so LLM opens with direct sector names."""
     if not picks or not picks.get("available"):
         return ""
-    lines = ["【板块形态优选·请据此直接回答】"]
-    lines.append("排序依据：领涨股股价形态+趋势+板块广度，不是单纯今日涨幅。")
+    lines = ["【板块形态优选·机会推断依据】"]
+    lines.append("以下板块按领涨股形态+趋势+广度评分，用于推断「可能延续的趋势」，不是单纯今日涨幅榜。")
+    lines.append("回答须说明：为何可能继续、参与方式（顺势/回踩）、若何种 Skill 信号出现则观点作废。")
     for i, row in enumerate(picks.get("top_picks") or [], 1):
         name = row.get("name") or ""
         btype = row.get("board_type") or ""
@@ -319,11 +362,65 @@ def format_sector_pick_hint(picks: dict[str, Any]) -> str:
         f"对前{scanned.get('ta_scanned') or 8}名做了形态分析。"
     )
     lines.append(
-        "用户问哪个板块看好：第一句话直接说第1～3个板块名，并用形态/趋势说理由；"
-        "禁止只按涨幅回答、禁止先讲大盘、禁止只列回避板块。"
+        "用户问机会/加仓：第一句话直接说第1～3个板块名，并给 Skill 依据的延续逻辑与参与条件；"
+        "结构配合时须明确参与方式，禁止只列风险或只说「别追高」。"
     )
     return "\n".join(lines)
 
 
+def compact_payload_for_llm(data: dict[str, Any]) -> dict[str, Any]:
+    """Strip fields that are for Python-side ranking only, not LLM context."""
+    out: dict[str, Any] = {}
+    for key in (
+        "retrieved_at",
+        "query_keywords",
+        "query_intents",
+        "sector_only",
+        "portfolio_focus",
+        "question_driven",
+        "workflow",
+        "wants_sector_pick",
+        "matched_sectors",
+        "data_reference",
+        "market",
+        "sector_picks",
+        "participant_flow",
+        "symbols",
+    ):
+        if key in data:
+            out[key] = data[key]
+
+    sectors = data.get("sectors")
+    if sectors:
+        compact_sectors: dict[str, Any] = {
+            "available": sectors.get("available"),
+            "note": sectors.get("note"),
+            "data_sources": sectors.get("data_sources"),
+        }
+        for board_key in ("industry", "concept"):
+            block = sectors.get(board_key) or {}
+            compact_sectors[board_key] = {
+                "available": block.get("available"),
+                "source": block.get("source"),
+                "count": block.get("count"),
+                "top_gainers": (block.get("top_gainers") or [])[:12],
+                "top_losers": (block.get("top_losers") or [])[:12],
+            }
+        out["sectors"] = compact_sectors
+
+    if "symbols" in out:
+        trimmed: list[dict[str, Any]] = []
+        for sym in out.get("symbols") or []:
+            row = dict(sym)
+            bars = row.get("candle_bars") or []
+            if len(bars) > 5:
+                row["candle_bars"] = bars[-5:]
+            trimmed.append(row)
+        out["symbols"] = trimmed
+
+    return out
+
+
 def format_fetch_block(data: dict[str, Any]) -> str:
-    return "【本轮检索数据】\n```json\n" + json.dumps(data, ensure_ascii=False, indent=2, default=str) + "\n```"
+    compact = compact_payload_for_llm(data)
+    return "【本轮检索数据】\n```json\n" + json.dumps(compact, ensure_ascii=False, indent=2, default=str) + "\n```"
