@@ -343,6 +343,7 @@ def format_sector_pick_hint(picks: dict[str, Any]) -> str:
         return ""
     lines = ["【板块形态优选·机会推断依据】"]
     lines.append("以下板块按领涨股形态+趋势+广度评分，用于推断「可能延续的趋势」，不是单纯今日涨幅榜。")
+    lines.append("大涨板块次日轮动概率高，优选会降权过热板块；须结合广度与证伪条件。")
     lines.append("回答须说明：为何可能继续、参与方式（顺势/回踩）、若何种 Skill 信号出现则观点作废。")
     for i, row in enumerate(picks.get("top_picks") or [], 1):
         name = row.get("name") or ""

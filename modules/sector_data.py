@@ -181,8 +181,9 @@ def build_sector_pick_summary(sectors: dict[str, Any], *, top_n: int = 5) -> dic
     if not sectors.get("available"):
         return {"available": False, "error": "sectors unavailable"}
     all_boards = _collect_all_boards(sectors)
-    top = rank_boards_by_ta(all_boards, top_n=top_n, ta_scan_limit=6)
+    top = rank_boards_by_ta(all_boards, top_n=top_n, ta_scan_limit=12)
     weak = _merge_top_boards(sectors, gainers=False, top_n=3)
+    scan_n = min(12, len(all_boards))
     return {
         "available": bool(top),
         "method": "technical_pattern",
@@ -192,7 +193,10 @@ def build_sector_pick_summary(sectors: dict[str, Any], *, top_n: int = 5) -> dic
             "industry_count": (sectors.get("industry") or {}).get("count"),
             "concept_count": (sectors.get("concept") or {}).get("count"),
             "boards_total": len(all_boards),
-            "ta_scanned": min(6, len(all_boards)),
+            "ta_scanned": scan_n,
         },
-        "note": "板块优选按领涨股股价形态+趋势+板块广度综合评分，不是单纯按今日涨幅排序。",
+        "note": (
+            "预筛选：全量700+板块按广度/蓄势规则筛候选（非涨幅榜），"
+            "行业+概念各取名额后共12个做领涨股K线形态分析，最终输出5个优选。"
+        ),
     }

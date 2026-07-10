@@ -78,17 +78,130 @@ def _breadth_ratio(row: dict[str, Any]) -> float | None:
     return rising / total
 
 
+def _daily_change_penalty(change_pct: Any) -> float:
+    """Penalize overheated boards; do not reward today's gain for forward picks."""
+    try:
+        pct = float(change_pct or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if pct >= 5.0:
+        return -0.25 * (pct - 5.0) - 0.5
+    if pct >= 3.0:
+        return -0.12 * (pct - 3.0)
+    if pct <= -4.0:
+        return -0.4
+    return 0.0
+
+
+def _lead_stock_anomaly_penalty(row: dict[str, Any]) -> float:
+    """Lone wolf lead or listing anomaly should not pull board into scan pool."""
+    try:
+        lead_pct = float(row.get("lead_change_pct") or 0)
+        board_pct = float(row.get("change_pct") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if abs(lead_pct) > 80:
+        return -3.0
+    if lead_pct - board_pct > 10 and board_pct < 2:
+        return -1.0
+    if lead_pct >= 0 and board_pct >= 0 and lead_pct - board_pct <= 4:
+        return 0.4
+    return 0.0
+
+
+def _pre_screen_eligible(row: dict[str, Any]) -> bool:
+    """Who deserves a K-line look — breadth/setup rules, not today's gain leaderboard."""
+    br = _breadth_ratio(row)
+    try:
+        pct = float(row.get("change_pct") or 0)
+        lead_pct = float(row.get("lead_change_pct") or 0) if row.get("lead_change_pct") is not None else pct
+    except (TypeError, ValueError):
+        pct, lead_pct = 0.0, 0.0
+
+    if abs(lead_pct) > 80:
+        return False
+    if br is not None and br < 0.35:
+        return False
+    if pct >= 6.0 and (br is None or br < 0.55):
+        return False
+
+    if br is not None and br >= 0.55:
+        return True
+    if br is not None and br >= 0.5 and -2.0 <= pct <= 3.0:
+        return True
+    if br is not None and br >= 0.45 and -1.0 <= pct <= 2.0:
+        return True
+    if br is None and -2.0 <= pct <= 2.5:
+        return True
+    return False
+
+
 def _pre_score_board(row: dict[str, Any]) -> float:
-    """Cheap filter before fetching K-lines."""
+    """Rank within eligible pool: breadth synergy + setup zone; change_pct not a reward."""
     score = 0.0
     br = _breadth_ratio(row)
     if br is not None:
-        score += (br - 0.5) * 4.0
+        score += (br - 0.5) * 6.0
     try:
-        score += float(row.get("change_pct") or 0) * 0.05
+        pct = float(row.get("change_pct") or 0)
     except (TypeError, ValueError):
-        pass
+        pct = 0.0
+    score += _daily_change_penalty(pct)
+    score += _lead_stock_anomaly_penalty(row)
+    if -1.0 <= pct <= 2.0 and (br is None or br >= 0.5):
+        score += 0.6
+    if br is not None and br >= 0.6 and -0.5 <= pct <= 1.5:
+        score += 0.5
     return score
+
+
+def _select_boards_for_ta_scan(boards: list[dict[str, Any]], *, limit: int = 12) -> list[dict[str, Any]]:
+    """Stratified pre-screen: industry + concept quotas, not one global gain-sorted list."""
+    if not boards:
+        return []
+    if len(boards) <= limit:
+        return list(boards)
+
+    eligible = [r for r in boards if _pre_screen_eligible(r)]
+    pool = eligible if eligible else list(boards)
+
+    industry = [r for r in pool if r.get("board_type") == "行业"]
+    concept = [r for r in pool if r.get("board_type") == "概念"]
+    n_industry = limit // 2 + (limit % 2)
+    n_concept = limit - n_industry
+
+    def _rank_pool(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return sorted(
+            rows,
+            key=lambda r: (
+                _breadth_ratio(r) or 0.0,
+                _pre_score_board(r),
+            ),
+            reverse=True,
+        )
+
+    picked: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _add(rows: list[dict[str, Any]]) -> None:
+        for row in rows:
+            name = str(row.get("name") or "")
+            if name and name not in seen:
+                seen.add(name)
+                picked.append(row)
+
+    _add(_rank_pool(industry)[:n_industry])
+    _add(_rank_pool(concept)[:n_concept])
+
+    if len(picked) < limit:
+        for row in _rank_pool(pool):
+            if len(picked) >= limit:
+                break
+            name = str(row.get("name") or "")
+            if name and name not in seen:
+                seen.add(name)
+                picked.append(row)
+    return picked[:limit]
 
 
 def _regime_from_df(df: pd.DataFrame, trend: str) -> str:
@@ -271,18 +384,21 @@ def score_board_row(row: dict[str, Any], *, ta: dict[str, Any] | None = None) ->
     ta_data = ta or analyze_lead_stock_ta(str(row.get("lead_stock") or ""))
     enriched["ta"] = ta_data
     ta_score = float(ta_data.get("ta_score") or 0) if ta_data.get("available") else 0.0
-    breadth_pts = ((br - 0.5) * 2.0) if br is not None else 0.0
-    try:
-        momentum_pts = float(row.get("change_pct") or 0) * 0.03
-    except (TypeError, ValueError):
-        momentum_pts = 0.0
+    breadth_pts = ((br - 0.5) * 2.5) if br is not None else 0.0
+    heat_penalty = _daily_change_penalty(row.get("change_pct"))
     if ta_data.get("available"):
-        total = ta_score * 1.2 + breadth_pts + momentum_pts
+        total = ta_score * 1.5 + breadth_pts + heat_penalty
     else:
-        total = breadth_pts + momentum_pts * 2
+        total = breadth_pts + heat_penalty
+    if br is not None and br < 0.45:
+        total -= 1.5
+        enriched["breadth_warning"] = "板块内多数个股走弱，形态参考降权"
     enriched["score"] = round(total, 2)
     enriched["breadth_ratio"] = round(br, 3) if br is not None else None
-    enriched["pick_reason"] = ta_data.get("reason") if ta_data.get("available") else "板块广度尚可，形态待验证"
+    reason = ta_data.get("reason") if ta_data.get("available") else "板块广度尚可，形态待验证"
+    if enriched.get("breadth_warning"):
+        reason = f"{reason}；{enriched['breadth_warning']}"
+    enriched["pick_reason"] = reason
     return enriched
 
 
@@ -290,10 +406,10 @@ def rank_boards_by_ta(
     boards: list[dict[str, Any]],
     *,
     top_n: int = 5,
-    ta_scan_limit: int = 6,
+    ta_scan_limit: int = 12,
 ) -> list[dict[str, Any]]:
     if not boards:
         return []
-    pre_ranked = sorted(boards, key=_pre_score_board, reverse=True)
-    scanned = [score_board_row(row) for row in pre_ranked[:ta_scan_limit]]
+    candidates = _select_boards_for_ta_scan(boards, limit=ta_scan_limit)
+    scanned = [score_board_row(row) for row in candidates]
     return sorted(scanned, key=lambda x: float(x.get("score") or 0), reverse=True)[:top_n]
