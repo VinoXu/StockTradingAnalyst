@@ -156,6 +156,9 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         if col_name not in existing:
             conn.execute(f"ALTER TABLE indicators ADD COLUMN {col_def}")
     migrate_chat_sessions(conn)
+    from modules.thesis_store import migrate_thesis_table
+
+    migrate_thesis_table(conn)
 
 
 def migrate_chat_sessions(conn: sqlite3.Connection) -> None:

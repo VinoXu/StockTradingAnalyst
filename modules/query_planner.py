@@ -58,6 +58,26 @@ _SECTOR_PICK_HINTS = (
     "看好", "推荐", "值得关注", "有机会", "主线在哪", "主线是什么",
 )
 
+_NEWS_PULSE_HINTS = (
+    "为什么涨", "为什么跌", "为何涨", "为何跌", "怎么回事", "什么原因",
+    "异动", "大跌", "大涨", "暴跌", "暴涨", "涨停", "跌停", "跳水", "暴雷", "冲高回落",
+)
+
+_DYP_ASK_HINTS = (
+    "本质是什么", "本质是啥", "10年后", "十年后", "还在吗", "护城河",
+    "好生意", "差生意", "段永平", "生意模式", "商业模式本质", "第一性原理",
+)
+
+_TA_SCREEN_HINTS = (
+    "快筛", "六关", "过关", "去劣", "硬筛", "质量筛", "能否深研", "值不值得深研",
+    "先筛", "淘汰规则", "红线", "checklist",
+)
+
+_PORTFOLIO_REVIEW_HINTS = (
+    "组合复盘", "复盘组合", "持仓复盘", "仓位结构", "集中度", "再平衡",
+    "组合风险", "持仓配置", "组合怎么样", "我的持仓", "看看组合", "组合诊断",
+)
+
 
 def _wants_sector_pick(message: str) -> bool:
     msg = (message or "").strip()
@@ -66,7 +86,57 @@ def _wants_sector_pick(message: str) -> bool:
     return any(h in msg for h in ("板块", "行业", "主线", "概念", "赛道"))
 
 
+def _wants_news_pulse(message: str) -> bool:
+    msg = (message or "").strip()
+    return any(h in msg for h in _NEWS_PULSE_HINTS)
+
+
+def _wants_dyp_ask(message: str) -> bool:
+    msg = (message or "").strip()
+    return any(h in msg for h in _DYP_ASK_HINTS)
+
+
+def _wants_ta_screen(message: str) -> bool:
+    msg = (message or "").strip().lower()
+    return any(h in msg for h in _TA_SCREEN_HINTS)
+
+
+def _wants_portfolio_review(message: str, plan: QueryPlan) -> bool:
+    """显式组合复盘话术才走 portfolio-review；普通「分析持仓」仍走个股深研。"""
+    msg = (message or "").strip()
+    return any(h in msg for h in _PORTFOLIO_REVIEW_HINTS)
+
+
+def _resolve_research_mode(plan: QueryPlan) -> str:
+    """symbol_research: 个股+研报；sector_research: 板块无研报。"""
+    # 专用 workflow 不占深研 mode，避免误跑 6 Agent / 误写 thesis
+    if plan.workflow in ("news_pulse", "dyp_ask", "portfolio_review", "ta_screen"):
+        return ""
+    if plan.portfolio_focus and plan.workflow == "portfolio_review":
+        return ""
+    if plan.symbols and not plan.sector_only:
+        return "symbol_research"
+    if plan.sector_only or plan.wants_sector_pick:
+        return "sector_research"
+    if plan.needs_sectors and not plan.symbols and "sector" in plan.intents:
+        return "sector_research"
+    return ""
+
+
 def _detect_workflow(message: str, intents: list[str], plan: QueryPlan) -> str:
+    if _wants_news_pulse(message) and (plan.symbols or plan.sector_only or plan.matched_sectors):
+        return "news_pulse"
+    if _wants_dyp_ask(message):
+        return "dyp_ask"
+    if _wants_portfolio_review(message, plan):
+        return "portfolio_review"
+    if _wants_ta_screen(message) and (plan.symbols or plan.sector_only or plan.wants_sector_pick or plan.matched_sectors):
+        return "ta_screen"
+    mode = _resolve_research_mode(plan)
+    if mode == "symbol_research":
+        return "symbol_research"
+    if mode == "sector_research":
+        return "sector_research"
     if plan.wants_sector_pick:
         return "opportunity_scan"
     if plan.sector_only:
@@ -120,6 +190,15 @@ class QueryPlan:
     matched_sectors: list[str] = field(default_factory=list)
     needs_charts: bool = False
     chart_kinds: list[str] = field(default_factory=list)
+    research_mode: str = ""
+    # --- 语义规划（规则 + LLM）；映射表仅作参考 ---
+    semantic_source: str = ""
+    intent_summary: str = ""
+    semantic_confidence: str = ""
+    agent_roster_override: tuple[tuple[str, str], ...] = ()
+    team_lead_skills_override: tuple[str, ...] = ()
+    task_briefs: list[dict] = field(default_factory=list)
+    semantic_fetch: dict = field(default_factory=dict)
 
 
 def _sector_only_query(message: str, intents: list[str]) -> bool:
@@ -182,11 +261,14 @@ def plan_query(message: str, selected: list[str] | None = None) -> QueryPlan:
             plan.portfolio_focus = True
             plan.needs_market = False
             plan.needs_sectors = False
+        plan.workflow = _detect_workflow(msg, plan.intents, plan)
+        plan.research_mode = _resolve_research_mode(plan)
     else:
         plan.question_driven = True
         plan.wants_sector_pick = _wants_sector_pick(msg)
         plan.matched_sectors = _match_sectors_in_message(msg)
         plan.workflow = _detect_workflow(msg, plan.intents, plan)
+        plan.research_mode = _resolve_research_mode(plan)
         if plan.workflow in _WORKFLOW_SECTOR or plan.matched_sectors:
             plan.needs_sectors = True
         if plan.workflow in _WORKFLOW_MARKET:
@@ -196,6 +278,16 @@ def plan_query(message: str, selected: list[str] | None = None) -> QueryPlan:
         elif plan.workflow == "question_deep_dive":
             plan.needs_market = True
             plan.needs_sectors = True
+
+    if plan.workflow == "portfolio_review":
+        plan.needs_market = False
+        plan.needs_sectors = False
+        if not plan.symbols:
+            plan.symbols = [h["symbol"].split(".")[0] for h in list_holdings()][:8]
+
+    if plan.workflow == "dyp_ask":
+        # 段式问答可不拉板块广度
+        plan.needs_sectors = False
 
     plan.keywords = list(dict.fromkeys(plan.keywords))[:12]
     return plan
@@ -230,7 +322,12 @@ def _compact_symbol(symbol: str) -> dict[str, Any]:
     }
 
 
-def fetch_data_for_plan(plan: QueryPlan, fallback_symbols: list[str] | None = None) -> dict[str, Any]:
+def fetch_data_for_plan(
+    plan: QueryPlan,
+    fallback_symbols: list[str] | None = None,
+    *,
+    message: str = "",
+) -> dict[str, Any]:
     """Call domain APIs based on extracted slots."""
     symbols = list(plan.symbols)
     if (
@@ -259,18 +356,27 @@ def fetch_data_for_plan(plan: QueryPlan, fallback_symbols: list[str] | None = No
         "portfolio_focus": plan.portfolio_focus,
         "question_driven": plan.question_driven,
         "workflow": plan.workflow,
+        "research_mode": plan.research_mode,
         "wants_sector_pick": plan.wants_sector_pick,
         "matched_sectors": plan.matched_sectors,
+        "semantic_source": plan.semantic_source,
+        "intent_summary": plan.intent_summary,
+        "semantic_confidence": plan.semantic_confidence,
+        "task_briefs": plan.task_briefs,
         "data_reference": collect_reference_meta(
             meta_symbols,
             include_live=not plan.sector_only and not skip_meta_live,
         ),
     }
 
-    if not plan.portfolio_focus and (plan.needs_market or plan.sector_only or not symbols):
+    sf = plan.semantic_fetch or {}
+    want_market = plan.needs_market if not sf else bool(sf.get("market", plan.needs_market))
+    want_sectors = plan.needs_sectors if not sf else bool(sf.get("sectors") or sf.get("sector_picks") or plan.needs_sectors)
+
+    if not plan.portfolio_focus and (want_market or plan.sector_only or not symbols):
         from modules.realtime_quotes import get_live_quote
 
-        refresh_breadth = plan.sector_only or plan.needs_market
+        refresh_breadth = plan.sector_only or want_market
         cache_key = f"data:market:{'breadth' if refresh_breadth else 'basic'}"
         market = get_or_set(
             cache_key,
@@ -283,14 +389,20 @@ def fetch_data_for_plan(plan: QueryPlan, fallback_symbols: list[str] | None = No
             market["index_live"] = index_live
         payload["market"] = market
 
-    if plan.needs_sectors:
+    if want_sectors:
         sectors = get_or_set(
             "data:sector_rankings",
             _SECTOR_CACHE_TTL,
             collect_sector_rankings,
         )
         payload["sectors"] = sectors
-        if plan.wants_sector_pick:
+        want_picks = (
+            plan.wants_sector_pick
+            or plan.research_mode == "sector_research"
+            or plan.workflow == "ta_screen"
+            or bool(sf.get("sector_picks"))
+        )
+        if want_picks:
             payload["sector_picks"] = get_or_set(
                 "data:sector_picks",
                 _SECTOR_CACHE_TTL,
@@ -298,8 +410,8 @@ def fetch_data_for_plan(plan: QueryPlan, fallback_symbols: list[str] | None = No
             )
 
     needs_participant = (
-        plan.needs_sectors
-        or plan.needs_market
+        want_sectors
+        or want_market
         or plan.sector_only
         or "capital_flow" in plan.intents
         or plan.wants_sector_pick
@@ -320,7 +432,59 @@ def fetch_data_for_plan(plan: QueryPlan, fallback_symbols: list[str] | None = No
         ]
         payload["participant_flow"] = collect_market_participant_context(sector_keywords=kws)
 
-    if symbols and not plan.sector_only:
+    # 研报/财报：语义 fetch 优先；否则按 research_mode
+    need_research = (
+        bool(sf.get("research_reports"))
+        if sf
+        else (
+            plan.research_mode == "symbol_research"
+            and plan.workflow != "news_pulse"
+            and bool(symbols)
+            and not plan.sector_only
+        )
+    )
+    need_fundamentals = (
+        bool(sf.get("fundamentals"))
+        if sf
+        else (
+            need_research
+            or (plan.workflow == "ta_screen" and bool(symbols) and not plan.sector_only)
+        )
+    )
+    if need_research and symbols and not plan.sector_only:
+        from modules.research_reports import collect_research_for_symbols
+
+        payload["research_reports"] = collect_research_for_symbols(symbols)
+    if need_fundamentals and symbols and not plan.sector_only:
+        from modules.fundamentals import collect_fundamentals_for_symbols
+
+        payload["fundamentals"] = collect_fundamentals_for_symbols(symbols)
+
+    need_holdings = bool(sf.get("holdings")) if sf else (plan.workflow == "portfolio_review" or plan.portfolio_focus)
+    if need_holdings:
+        holdings = list_holdings()
+        payload["holdings"] = [
+            {
+                "symbol": h.get("symbol"),
+                "name": h.get("name"),
+                "qty": h.get("qty"),
+                "cost": h.get("cost"),
+            }
+            for h in holdings[:30]
+        ]
+
+    need_news = bool(sf.get("news")) if sf else (plan.workflow == "news_pulse")
+    if need_news:
+        from modules.news_pulse import collect_news_pulse, parse_change_pct_from_message
+
+        payload["news_pulse"] = collect_news_pulse(
+            symbols=symbols if not plan.sector_only else None,
+            sector_keywords=(plan.matched_sectors or plan.keywords or [])[:5],
+            change_pct_hint=parse_change_pct_from_message(message),
+        )
+
+    want_quotes = True if not sf else bool(sf.get("quotes", True))
+    if want_quotes and symbols and not plan.sector_only:
         from modules.realtime_quotes import attach_live_to_symbol_payload, get_live_quotes
 
         norm_syms = [_normalize_symbol(s) for s in symbols[:8]]
@@ -370,7 +534,7 @@ def format_sector_pick_hint(picks: dict[str, Any]) -> str:
 
 
 def compact_payload_for_llm(data: dict[str, Any]) -> dict[str, Any]:
-    """Strip fields that are for Python-side ranking only, not LLM context."""
+    """Strip process-only fields (agent evidence/cards) and trim LLM-facing packs."""
     out: dict[str, Any] = {}
     for key in (
         "retrieved_at",
@@ -380,7 +544,13 @@ def compact_payload_for_llm(data: dict[str, Any]) -> dict[str, Any]:
         "portfolio_focus",
         "question_driven",
         "workflow",
+        "research_mode",
         "wants_sector_pick",
+        "research_reports",
+        "fundamentals",
+        "news_pulse",
+        "report_qa",
+        "research_synthesis_hint",
         "matched_sectors",
         "data_reference",
         "market",
@@ -418,6 +588,54 @@ def compact_payload_for_llm(data: dict[str, Any]) -> dict[str, Any]:
                 row["candle_bars"] = bars[-5:]
             trimmed.append(row)
         out["symbols"] = trimmed
+
+    rr = data.get("research_reports")
+    if rr:
+        compact_rr: dict[str, Any] = {"available": rr.get("available"), "symbols": []}
+        for row in rr.get("symbols") or []:
+            compact_rr["symbols"].append(
+                {
+                    "symbol": row.get("symbol"),
+                    "available": row.get("available"),
+                    "confidence": row.get("confidence"),
+                    "consensus_note": row.get("consensus_note"),
+                    "rating_summary": row.get("rating_summary"),
+                    "recent_reports": (row.get("recent_reports") or [])[:5],
+                }
+            )
+        out["research_reports"] = compact_rr
+
+    fund = data.get("fundamentals")
+    if fund:
+        compact_fund: dict[str, Any] = {"available": fund.get("available"), "symbols": []}
+        for row in fund.get("symbols") or []:
+            compact_fund["symbols"].append(
+                {
+                    "symbol": row.get("symbol"),
+                    "available": row.get("available"),
+                    "confidence": row.get("confidence"),
+                    "highlights": row.get("highlights"),
+                    "rigor": {
+                        "all_ok": (row.get("rigor") or {}).get("all_ok"),
+                        "warnings": (row.get("rigor") or {}).get("warnings"),
+                    },
+                }
+            )
+        out["fundamentals"] = compact_fund
+
+    if data.get("news_pulse"):
+        out["news_pulse"] = data["news_pulse"]
+
+    if data.get("report_qa"):
+        out["report_qa"] = data["report_qa"]
+
+    if data.get("research_synthesis_hint"):
+        out["research_synthesis_hint"] = data["research_synthesis_hint"]
+
+    # Process-only: never forward agent_evidence / agent_cards / full thesis_drift JSON
+    notes = data.get("thesis_drift_notes") or []
+    if notes:
+        out["thesis_drift_notes"] = list(notes)[:3]
 
     return out
 

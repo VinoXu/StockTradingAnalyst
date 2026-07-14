@@ -2,9 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterator
 from typing import Any
 
+from modules.agent_parallel import (
+    build_team_lead_messages,
+    build_thin_fact_sheet,
+    rank_and_filter_agent_cards,
+    run_parallel_agents,
+)
+from modules.agent_specs import agent_roster_for_plan, should_persist_thesis
 from modules.analysis_mandate import CORE_ANALYSIS_MANDATE
 from modules.chart_builder import build_charts
 from modules.chat_history import (
@@ -19,7 +28,7 @@ from modules.chat_history import (
     refresh_session_summary_async,
     set_active_session,
 )
-from modules.context_guard import assess_payload, trim_fetched_aggressive
+from modules.context_guard import PAYLOAD_BLOCKED_HINT, assess_payload, trim_fetched_aggressive
 from modules.conversation_memory import assess_context_limit, build_memory_block
 from modules.cot_prompt import build_cot_instruction, strip_cot_leakage
 from modules.data_timestamps import collect_reference_meta, format_time_banner
@@ -37,12 +46,25 @@ from modules.query_planner import (
     format_sector_pick_hint,
     plan_query,
 )
+from modules.research_orchestrator import enrich_research_payload
+from modules.runtime_cache import get_or_set, purge_expired
+from modules.semantic_planner import plan_semantics, semantic_debug_dict
 from modules.skill_mapper import select_skills_for_plan, skills_summary
 from modules.text_format import humanize_reply, humanize_stream_display
+from modules.thesis_store import build_thesis_snapshot, load_thesis_context_for_symbols, save_thesis
 from modules.ui_log import log_ui_event
 
 _ui_turns: dict[str, list[dict[str, str]]] = {}
 _raw_turns: dict[str, list[tuple[str, str]]] = {}
+
+_RESEARCH_PROCESS_TTL = 600.0
+
+
+def _research_cache_prefix(session_id: str, plan, message: str) -> str:
+    symbols = ",".join(sorted(plan.symbols or []))
+    mode = plan.research_mode or plan.workflow or "q"
+    digest = hashlib.sha256((message or "").encode("utf-8")).hexdigest()[:16]
+    return f"research:{session_id}:{mode}:{symbols}:{digest}"
 
 
 def _resolve_scope(selected: list[str]) -> tuple[str, str | None, list[str] | None]:
@@ -203,6 +225,30 @@ _WORKFLOW_HINTS: dict[str, str] = {
         "【工作流·问题驱动】先答用户真正要什么（机会还是风险），"
         "再从 market/sectors 中匹配数据，用 Skill 做 forward 推断，禁止行情复述充字数。"
     ),
+    "symbol_research": (
+        "【工作流·个股深研】六 Agent：Nison 蜡烛图 + Murphy 趋势量价 + 四大师（研报/估值）。"
+        "必须引用 research_reports 共识与 symbols 技术字段；写清矛盾点、证伪条件、偏多观察/观望/降权。"
+    ),
+    "sector_research": (
+        "【工作流·板块深研】四 Agent：Nison + Murphy + 芒格 + 李录；不调研报、不拉个股财报。"
+        "基于 sector_picks 与广度；写淘汰理由与证伪条件，禁止追涨幅榜。"
+    ),
+    "news_pulse": (
+        "【工作流·异动归因】快速回答「发生了什么」；区分价值事件/情绪波动/真因不明。"
+        "引用 news_pulse 与并行 Agent 结论，不要深度研报式长篇。"
+    ),
+    "portfolio_review": (
+        "【工作流·组合复盘】对照 holdings 权重与标的趋势；输出集中度、板块暴露、再平衡语气；"
+        "用语偏多观察/观望/降权，禁止买卖指令。"
+    ),
+    "dyp_ask": (
+        "【工作流·段永平式问答】用大白话回答「本质是什么」「10 年后还在吗」；"
+        "少堆指标；可点名生意质量，勿强行六 Agent 深研体。"
+    ),
+    "ta_screen": (
+        "【工作流·TA 快筛】按六关 + 去劣红线给出通过/不通过/灰色；"
+        "明确是否值得进入深研，并写淘汰理由。"
+    ),
 }
 
 
@@ -286,6 +332,43 @@ def _compose_user_message(
     pick_hint = format_sector_pick_hint(fetched.get("sector_picks") or {})
     if pick_hint:
         parts.append(pick_hint)
+    synth = (fetched.get("research_synthesis_hint") or "").strip()
+    if synth:
+        parts.append(synth)
+    rr = fetched.get("research_reports") or {}
+    if rr.get("available"):
+        lines = ["【券商研报共识·个股】"]
+        for row in rr.get("symbols") or []:
+            if not row.get("available"):
+                continue
+            code = row.get("symbol") or ""
+            conf = row.get("confidence") or "?"
+            note = row.get("consensus_note") or ""
+            lines.append(f"- {code}：置信{conf}，{note}")
+            for rep in (row.get("recent_reports") or [])[:3]:
+                lines.append(f"  · {rep.get('publish_date')} {rep.get('org')} {rep.get('rating')} {rep.get('title')}")
+        parts.append("\n".join(lines))
+    fund = fetched.get("fundamentals") or {}
+    if fund.get("available"):
+        flines = ["【结构化财报·个股】"]
+        for row in fund.get("symbols") or []:
+            if not row.get("available"):
+                continue
+            code = row.get("symbol") or ""
+            h = row.get("highlights") or {}
+            conf = row.get("confidence") or "?"
+            flines.append(
+                f"- {code} 置信{conf}：PE(TTM){h.get('pe_ttm')} PB{h.get('pb')} "
+                f"ROE{h.get('roe')}% 毛利率{h.get('gross_margin')}% "
+                f"净利同比{h.get('net_profit_yoy')}%"
+            )
+            rigor = row.get("rigor") or {}
+            for w in rigor.get("warnings") or []:
+                flines.append(f"  ⚠ {w}")
+        parts.append("\n".join(flines))
+    qa = fetched.get("report_qa") or {}
+    if qa.get("issues"):
+        parts.append("【数据质检】" + "；".join(qa["issues"]))
     pf = fetched.get("participant_flow") or {}
     if pf.get("northbound", {}).get("available"):
         nb = pf["northbound"]
@@ -317,6 +400,114 @@ def _compose_user_message(
         + (f"\n{sector_hint}" if sector_hint else "")
     )
     return "\n\n".join(parts)
+
+
+def _should_run_parallel_agents(plan) -> bool:
+    if agent_roster_for_plan(plan):
+        return True
+    if plan.workflow in ("news_pulse", "dyp_ask", "portfolio_review", "ta_screen"):
+        return True
+    return bool(plan.research_mode)
+
+
+def _team_lead_extra_parts(fetched: dict, message: str) -> list[str]:
+    parts: list[str] = [CORE_ANALYSIS_MANDATE, build_cot_instruction(fetched)]
+    if fetched.get("intent_summary"):
+        parts.append(f"【语义规划意图】{fetched.get('intent_summary')}")
+    briefs = fetched.get("task_briefs") or []
+    if briefs:
+        parts.append(
+            "【任务拆分】\n```json\n"
+            + json.dumps(briefs, ensure_ascii=False, indent=2, default=str)[:4000]
+            + "\n```"
+        )
+    wf = fetched.get("workflow") or ""
+    hint = _WORKFLOW_HINTS.get(wf)
+    if hint:
+        parts.append(hint)
+    synth = (fetched.get("research_synthesis_hint") or "").strip()
+    if synth:
+        parts.append(synth)
+    pick_hint = format_sector_pick_hint(fetched.get("sector_picks") or {})
+    if pick_hint:
+        parts.append(pick_hint)
+    np = fetched.get("news_pulse") or {}
+    if np.get("available"):
+        lines = ["【异动新闻摘要】"]
+        for row in np.get("symbols") or []:
+            lines.append(f"- {row.get('symbol')} 性质猜测:{row.get('nature_guess')}")
+            for n in (row.get("recent_news") or [])[:4]:
+                lines.append(f"  · {n.get('time')} {n.get('title')}")
+        parts.append("\n".join(lines))
+    return parts
+
+
+def _infer_stance_from_cards(cards: list[dict]) -> str:
+    stances = [c.get("stance") for c in cards if c.get("stance")]
+    if not stances:
+        return "观望"
+    if stances.count("偏多观察") >= max(1, len(stances) // 2):
+        return "偏多观察"
+    if stances.count("降权") >= 2:
+        return "降权"
+    return "观望"
+
+
+def _run_agents_and_build_messages(
+    *,
+    effective: list[str],
+    plan,
+    memory_block: str,
+    fetched: dict,
+    message: str,
+    cache_prefix: str | None = None,
+) -> tuple[dict, list[dict[str, str]], list[dict]]:
+    def _run() -> list[dict]:
+        return run_parallel_agents(fetched, plan, message)
+
+    if cache_prefix:
+        agent_cards = get_or_set(f"{cache_prefix}:agents", _RESEARCH_PROCESS_TTL, _run)
+    else:
+        agent_cards = _run()
+
+    fetched = dict(fetched)
+    fetched["agent_cards"] = agent_cards
+    kept, board = rank_and_filter_agent_cards(agent_cards)
+    thin_sheet = build_thin_fact_sheet(fetched)
+    fetched["kept_agent_cards"] = kept
+    fetched["agent_scoreboard"] = board
+    fetched["agent_filter"] = {
+        "kept_agents": list(board.get("kept_agents") or []),
+        "dropped_agents": list(board.get("dropped_agents") or []),
+        "agent_card_chars": len(json.dumps(kept, ensure_ascii=False, default=str)),
+        "thin_sheet_chars": len(thin_sheet or ""),
+        "avg_score": board.get("avg_score"),
+    }
+
+    if plan.research_mode == "symbol_research" and plan.symbols and should_persist_thesis(plan):
+        drift_pack = load_thesis_context_for_symbols(plan.symbols, agent_cards)
+        fetched["thesis_drift"] = drift_pack
+        for row in drift_pack.get("symbols") or []:
+            d = row.get("drift") or {}
+            if d.get("available") and d.get("summary"):
+                fetched.setdefault("thesis_drift_notes", []).append(d["summary"])
+        # Refresh thin sheet after drift notes attached
+        thin_sheet = build_thin_fact_sheet(fetched)
+        fetched["agent_filter"]["thin_sheet_chars"] = len(thin_sheet or "")
+
+    scope, symbol, symbols = _resolve_scope(effective)
+    messages = build_team_lead_messages(
+        plan=plan,
+        scope_note=_scope_note(scope, symbol, symbols),
+        message=message,
+        fetched=fetched,
+        agent_cards=kept,
+        memory_block=memory_block,
+        extra_parts=_team_lead_extra_parts(fetched, message),
+        scoreboard=board,
+        thin_sheet=thin_sheet,
+    )
+    return fetched, messages, agent_cards
 
 
 def _strip_llm_time_preamble(text: str) -> str:
@@ -418,36 +609,80 @@ def _prepare_ask_llm(
     if append_user_turn:
         turns.append({"role": "user", "content": message})
 
+    purge_expired()
+
     plan = plan_query(message, user_selected)
-    fetched = fetch_data_for_plan(
-        plan,
-        None if no_selection else user_selected,
-    )
+    plan, semantic = plan_semantics(message, plan)
+    cache_prefix = _research_cache_prefix(sid, plan, message)
+
+    def _load_fetched() -> dict:
+        data = fetch_data_for_plan(
+            plan,
+            None if no_selection else user_selected,
+            message=message,
+        )
+        data = enrich_research_payload(data, plan)
+        data["semantic_plan"] = semantic_debug_dict(semantic)
+        return data
+
+    fetched = get_or_set(f"{cache_prefix}:fetched", _RESEARCH_PROCESS_TTL, _load_fetched)
 
     memory_block, _memory_truncated = build_memory_block(prior, session_summary=session_summary)
-    messages = _build_llm_messages(
-        effective=effective,
-        plan=plan,
-        memory_block=memory_block,
-        fetched=fetched,
-        message=message,
-    )
-    preflight = assess_payload(messages)
-    payload_trimmed = False
-    if preflight["payload_blocked"]:
-        before_chars = preflight["payload_chars"]
-        trimmed_fetch = trim_fetched_aggressive(fetched)
+    agent_cards: list[dict] = []
+    used_parallel = False
+    if _should_run_parallel_agents(plan):
+        used_parallel = True
+        fetched, messages, agent_cards = _run_agents_and_build_messages(
+            effective=effective,
+            plan=plan,
+            memory_block=memory_block,
+            fetched=fetched,
+            message=message,
+            cache_prefix=cache_prefix,
+        )
+    else:
         messages = _build_llm_messages(
             effective=effective,
             plan=plan,
             memory_block=memory_block,
-            fetched=trimmed_fetch,
+            fetched=fetched,
             message=message,
         )
+    preflight = assess_payload(messages)
+    payload_trimmed = False
+    if preflight["payload_blocked"]:
+        before_chars = preflight["payload_chars"]
+        if used_parallel:
+            # Never rebuild Lead prompt from full fetch; shrink memory / thin sheet only
+            kept = fetched.get("kept_agent_cards") or []
+            board = fetched.get("agent_scoreboard") or {}
+            scope, symbol, symbols = _resolve_scope(effective)
+            slim_memory = (memory_block or "")[:1500]
+            messages = build_team_lead_messages(
+                plan=plan,
+                scope_note=_scope_note(scope, symbol, symbols),
+                message=message,
+                fetched=fetched,
+                agent_cards=kept,
+                memory_block=slim_memory,
+                extra_parts=[CORE_ANALYSIS_MANDATE],
+                scoreboard=board,
+                thin_sheet="",
+            )
+        else:
+            trimmed_fetch = trim_fetched_aggressive(fetched)
+            messages = _build_llm_messages(
+                effective=effective,
+                plan=plan,
+                memory_block=memory_block,
+                fetched=trimmed_fetch,
+                message=message,
+            )
         preflight = assess_payload(messages)
         payload_trimmed = preflight["payload_chars"] < before_chars
 
-    skill_names = select_skills_for_plan(plan, scope=_resolve_scope(effective)[0])
+    skill_names = select_skills_for_plan(plan, scope=_resolve_scope(effective)[0], team_lead=bool(agent_cards))
+    agent_filter = fetched.get("agent_filter") or {}
     log_ui_event(
         "context_preflight",
         detail={
@@ -457,6 +692,16 @@ def _prepare_ask_llm(
             "payload_blocked": preflight.get("payload_blocked"),
             "payload_trimmed": payload_trimmed,
             "skills": list(skill_names),
+            "semantic_source": plan.semantic_source,
+            "semantic_confidence": plan.semantic_confidence,
+            "intent_summary": plan.intent_summary,
+            "agent_roster": [a for a, _ in agent_roster_for_plan(plan)],
+            "task_briefs": plan.task_briefs[:6],
+            "kept_agents": agent_filter.get("kept_agents"),
+            "dropped_agents": agent_filter.get("dropped_agents"),
+            "agent_card_chars": agent_filter.get("agent_card_chars"),
+            "thin_sheet_chars": agent_filter.get("thin_sheet_chars"),
+            "avg_score": agent_filter.get("avg_score"),
         },
         session_id=sid,
     )
@@ -464,14 +709,18 @@ def _prepare_ask_llm(
     if preflight["payload_blocked"]:
         if append_user_turn and turns and turns[-1].get("role") == "user":
             turns.pop()
+        hint = preflight.get("payload_hint") or PAYLOAD_BLOCKED_HINT
         return {
             "ok": False,
-            "error": preflight.get("payload_hint"),
+            "error": hint,
             "payload_chars": preflight.get("payload_chars"),
             "payload_limit": preflight.get("payload_limit"),
             "need_new_chat": True,
+            "context_full": True,
+            "new_chat_hint": hint,
         }, None
 
+    purge_expired()
     return None, {
         "sid": sid,
         "message": message,
@@ -483,6 +732,8 @@ def _prepare_ask_llm(
         "preflight": preflight,
         "payload_trimmed": payload_trimmed,
         "skill_names": skill_names,
+        "fetched": fetched,
+        "agent_cards": agent_cards,
     }
 
 
@@ -520,6 +771,23 @@ def _complete_ask_turn(ctx: dict[str, Any], raw_reply: str) -> dict[str, Any]:
 
     append_turn(int(sid), message, reply)
     refresh_session_summary_async(int(sid))
+
+    fetched = ctx.get("fetched") or {}
+    agent_cards = ctx.get("agent_cards") or []
+    if should_persist_thesis(plan) and plan.symbols and agent_cards:
+        stance = _infer_stance_from_cards(agent_cards)
+        for sym in plan.symbols[:3]:
+            try:
+                save_thesis(
+                    sym,
+                    session_id=int(sid),
+                    stance=stance,
+                    thesis=build_thesis_snapshot(agent_cards=agent_cards, fetched=fetched),
+                    reply_excerpt=body[:800],
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
     ctx_after = _session_context_status(sid)
     return {
         "ok": True,
@@ -537,7 +805,13 @@ def _complete_ask_turn(ctx: dict[str, Any], raw_reply: str) -> dict[str, Any]:
             "intents": plan.intents,
             "symbols": plan.symbols or effective,
             "workflow": plan.workflow,
+            "research_mode": plan.research_mode,
             "skills": list(skill_names),
+            "semantic_source": plan.semantic_source,
+            "semantic_confidence": plan.semantic_confidence,
+            "intent_summary": plan.intent_summary,
+            "agents": [a for a, _ in agent_roster_for_plan(plan)],
+            "task_briefs": plan.task_briefs[:8],
         },
         "payload_chars": preflight.get("payload_chars"),
         "payload_limit": preflight.get("payload_limit"),
@@ -569,6 +843,8 @@ def ask_stream_events(
         "phase": "preparing",
         "skills": list(ctx["skill_names"]),
         "workflow": ctx["plan"].workflow,
+        "research_mode": ctx["plan"].research_mode,
+        "parallel_agents": bool(ctx.get("agent_cards")),
     }
     yield {
         "event": "preflight",

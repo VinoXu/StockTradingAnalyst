@@ -429,8 +429,16 @@ def build_chat_system_prompt(
     skill_names: tuple[str, ...] | list[str] | None = None,
     scope_note: str = "",
 ) -> str:
-    """System prompt: style rules + selected Skill criteria only (no heavy JSON)."""
-    names = tuple(skill_names) if skill_names else runtime_skill_names()
+    """System prompt: style rules + optional Skill bodies.
+
+    skill_names is None → load all runtime skills (legacy default).
+    skill_names is () → inject no Skill bodies (Team Lead synthesis).
+    skill_names is a non-empty sequence → inject those Skills only.
+    """
+    if skill_names is None:
+        names = runtime_skill_names()
+    else:
+        names = tuple(skill_names)
     parts = [CHAT_SYSTEM]
     if scope_note:
         parts.extend(["", scope_note])

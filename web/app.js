@@ -881,8 +881,8 @@ async function loadHistory() {
 }
 
 function applyContextStatus(data) {
-  contextFull = !!data?.context_full;
-  const hint = data?.new_chat_hint;
+  contextFull = !!(data?.context_full || data?.need_new_chat);
+  const hint = data?.new_chat_hint || (data?.need_new_chat ? data?.error : null);
   if (contextFull && hint) {
     contextLimitText.textContent = hint;
     contextLimitBanner.classList.remove('hidden');

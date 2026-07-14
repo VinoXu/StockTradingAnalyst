@@ -2,7 +2,7 @@
 
 > **Local A-share TA assistant: skills + indicators + optional LLM chat. No auto-trading.**
 
-本地 A 股技术分析投研助手：墨菲 **7 个 TA Skill** + 尼森 **3 个 Skill** + **Python 数值计算** + **Web / CLI 问答**（可选 LLM 增强，支持任意 OpenAI 兼容 API）。
+本地 A 股技术分析投研助手：**27 个 Skill**（墨菲 7 + 尼森 3 + 资金面 + 四大师 + 深研场景 + 基本面 + 组合 + 异动）+ **Python 数值计算** + **多 Agent 深研** + **Web / CLI 问答**（可选 LLM 增强，支持任意 OpenAI 兼容 API）。
 
 > GitHub 仓库名可能为 `StockTradingAnalyst`，与产品名 Profit Protector 指同一项目。
 
@@ -22,8 +22,8 @@ Profit_Protector/
 ├── .env.example
 ├── data/
 │   └── portfolio.db       ← 本地生成（对话/持仓/行情），不入库
-├── skills/                ← 分析判据（10 个 SKILL.md）
-├── modules/               ← 指标、分析、LLM、对话、持仓
+├── skills/                ← 分析判据（27 个 SKILL.md）
+├── modules/               ← 指标、分析、LLM、多 Agent 深研、对话、持仓
 ├── scripts/               ← CLI 工具
 └── web/                   ← 静态前端
 ```
@@ -32,21 +32,38 @@ Profit_Protector/
 
 | 层 | 职责 |
 |----|------|
-| **skills/** | 墨菲 + 尼森 + 资金面判据（10 个 `SKILL.md`） |
-| **modules/** | 指标/形态/趋势计算、意图规划、按需取数、LLM 对话 |
+| **skills/** | 墨菲 + 尼森 + 资金面 + 四大师 + 深研/筛选/基本面/组合/异动（27 个 `SKILL.md`） |
+| **modules/** | 指标/形态/趋势计算、意图规划、按需取数、多 Agent 并行深研、LLM 对话 |
 | **web/** | 浏览器界面（流式聊天、持仓、API 设置） |
 
 ### 对话链路（Web）
 
 ```text
 用户问题
-  → query_planner（意图 / workflow / 标的槽位）
-  → skill_mapper（按意图注入相关 Skill，非全量）
-  → fetch_data_for_plan（大盘 / 板块 / 个股 / 参与者资金，按需 + TTL 缓存）
-  → context_guard（payload 体积预检，超限渐进裁剪）
-  → LLM（隐藏 COT 推理 + 流式输出 + Markdown 实时清理）
-  → 会话摘要写入 SQLite（30 天保留）
+  → query_planner（规则：关键词/槽位 → 线索）
+  → semantic_planner（LLM 意图分析 + 任务拆分；映射表仅参考；失败回退规则）
+  → fetch_data_for_plan（按语义 fetch 需求取数）
+  → research_orchestrator（证据包 + QA）
+  → agent_parallel（按拆分后的 Agent/Skill 并行）
+  → skill_mapper + Team Lead（注入语义指定的场景 Skill）
+  → context_guard（payload 体积预检）
+  → LLM 流式输出
+  → investment_thesis（仅完整个股深研）
+  → 会话摘要
 ```
+
+可选环境变量：`SEMANTIC_LLM_PLANNER=0` 关闭 LLM 语义规划（纯规则）；`RESEARCH_PARALLEL_AGENTS=0` 关闭并行 Agent。
+
+### 深研模式（前端 API 不变：`POST /api/chat/stream`）
+
+| 模式 | 触发（规则线索 / LLM 可改） | 取数 | 并行 Agent（参考上限；LLM 可精简） |
+|------|------------------------------|------|----------------------------------|
+| **symbol_research** | 个股深研语义 | 行情 + 研报 + 财报 | 参考 6：Nison+Murphy+四大师 |
+| **sector_research** | 板块深研语义 | 板块广度 + 优选 | 参考 4 |
+| **news_pulse** | 异动归因 | 新闻 + 行情 | 参考 3 |
+| **portfolio_review** | 组合复盘 | holdings + 行情 | 参考 3 |
+| **ta_screen** | 六关/去劣快筛 | 行情 / picks | 参考 3 |
+| **dyp_ask** | 本质/10年后 | 可选行情 | 参考 1 |
 
 ## 环境要求
 
@@ -89,6 +106,18 @@ LLM_MODEL=deepseek-chat
 ```text
 LLM_MAX_INPUT_CHARS=90000
 LLM_WARN_INPUT_CHARS=75000
+```
+
+可选：关闭多 Agent 并行（调试用，默认开启）：
+
+```text
+RESEARCH_PARALLEL_AGENTS=0
+```
+
+可选：关闭 LLM 语义规划（纯规则回退，默认开启）：
+
+```text
+SEMANTIC_LLM_PLANNER=0
 ```
 
 ### 支持的 LLM 接入方式
@@ -143,7 +172,7 @@ python app.py
 | `sync_market.py` | 同步指数 + 市场广度 |
 | `sync_symbol.py` | 同步个股行情、指标、资金流 |
 | `portfolio_cli.py` | 持仓 add / list / remove |
-| `chat_advisor.py` | CLI 交互问答 |
+| `chat_advisor.py` | CLI 交互问答（**未**走 Web 多 Agent / 语义规划；全量 Skill） |
 | `advise_portfolio.py` | 组合批量建议 |
 | `advise_symbol.py` | 单标的建议 |
 | `diagnose_akshare.py` | 数据源连通诊断 |
@@ -151,8 +180,8 @@ python app.py
 
 ## 功能范围
 
-- **Skill 判据**：墨菲 7 + 尼森 3 + 资金面
-- **modules**：指标、形态、趋势、大盘广度、组合建议、LLM 流式问答
+- **Skill 判据**：27 个全部 live（含财报精读、六关/去劣、组合复盘、段式问答等独立 workflow）
+- **modules**：指标、形态、趋势、大盘广度、多 Agent 深研、组合建议、LLM 流式问答
 - **不做**：自动交易、券商下单
 
 ## 数据与隐私

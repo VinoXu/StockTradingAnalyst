@@ -8,31 +8,45 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from modules.skill_registry import (
+    ALL_SKILL_NAMES,
+    CAPITAL_SKILL_NAMES,
+    LEGACY_SKILL_NAMES,
+    MURPHY_SKILL_NAMES,
+)
+from modules.skill_registry import (
+    NISON_SKILL_NAMES as _NISON_NAMES,
+)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SKILLS_DIR = PROJECT_ROOT / "skills"
 
-# 原有墨菲融合版 Skill（勿改目录内文件）
-SKILL_NAMES = (
-    "ta-oscillators",
-    "ta-moving-average-boll",
-    "ta-volume-price",
-    "ta-trend-structure",
-    "ta-candlestick",
-    "ta-price-patterns",
-    "a-share-capital-flow",
-)
+# 向后兼容：原 SKILL_NAMES = 墨菲 + 资金面（不含 Nison 目录）
+SKILL_NAMES = MURPHY_SKILL_NAMES + CAPITAL_SKILL_NAMES
 
-# 《日本蜡烛图技术》提炼版，独立目录，不影响上方原有 Skill
-NISON_SKILL_NAMES = (
-    "nison-candlestick-patterns",
-    "nison-signal-confluence",
-    "nison-ta-integration",
-)
+# 尼森框架目录名（Agent-1）
+NISON_SKILL_NAMES = _NISON_NAMES
 
 
 def runtime_skill_names() -> tuple[str, ...]:
-    """All skills injected into LLM runtime context."""
-    return SKILL_NAMES + NISON_SKILL_NAMES
+    """All skills that may be injected into LLM runtime context."""
+    return ALL_SKILL_NAMES
+
+
+def murphy_skill_names() -> tuple[str, ...]:
+    return MURPHY_SKILL_NAMES
+
+
+def nison_skill_names() -> tuple[str, ...]:
+    return NISON_SKILL_NAMES
+
+
+def capital_skill_names() -> tuple[str, ...]:
+    return CAPITAL_SKILL_NAMES
+
+
+def legacy_skill_names() -> tuple[str, ...]:
+    return LEGACY_SKILL_NAMES
 
 
 def skill_path(name: str) -> Path:
@@ -49,7 +63,7 @@ def load_skill(name: str) -> str:
     return _load_skill_cached(name)
 
 
-@lru_cache(maxsize=16)
+@lru_cache(maxsize=32)
 def _load_skill_cached(name: str) -> str:
     path = skill_path(name)
     if not path.is_file():
@@ -58,8 +72,8 @@ def _load_skill_cached(name: str) -> str:
 
 
 def load_all_skills() -> dict[str, str]:
-    return {name: load_skill(name) for name in runtime_skill_names()}
+    return {name: load_skill(name) for name in runtime_skill_names() if skill_path(name).is_file()}
 
 
 def list_skills() -> list[str]:
-    return list(runtime_skill_names())
+    return [n for n in runtime_skill_names() if (SKILLS_DIR / n / "SKILL.md").is_file()]
