@@ -390,6 +390,15 @@ def collect_market_context(*, refresh_breadth: bool = False) -> dict[str, Any]:
     if refresh_breadth:
         sync_market_breadth()
     dow = analyze_dow_confirmation()
+    # 本地 INDEX 日K 为空时自动补同步一次（此前只能干瞪眼提示 sync_market）
+    if not dow.get("available"):
+        try:
+            from modules.market_data import sync_indices
+
+            sync_indices()
+            dow = analyze_dow_confirmation()
+        except Exception:  # noqa: BLE001
+            pass
     breadth = analyze_market_breadth()
     times = market_data_as_of()
     breadth_as_of = times.get("breadth") or {}

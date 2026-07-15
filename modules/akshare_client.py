@@ -148,8 +148,135 @@ def fetch_a_spot_em() -> pd.DataFrame:
 
 
 def fetch_index_spot_em() -> pd.DataFrame:
-    """Major index intraday spot quotes."""
-    return fetch_with_retry(ak.stock_zh_index_spot_em)
+    """Major index intraday spot quotes (East Money)."""
+    return fetch_with_retry(ak.stock_zh_index_spot_em, max_retry=3, base_delay=1.5)
+
+
+def _index_code_to_tx(code: str) -> str:
+    c = str(code).strip()
+    if c.startswith(("sh", "sz", "bj")):
+        return c
+    if c.startswith("399") or c.startswith("159"):
+        return f"sz{c}"
+    return f"sh{c}"
+
+
+def fetch_index_quotes_tencent(codes: list[str]) -> dict[str, dict[str, Any]]:
+    """Intraday index quotes via Tencent qt.gtimg.cn (fallback when East Money is blocked)."""
+    import urllib.error
+    import urllib.request
+
+    wanted = [str(c).strip() for c in codes if str(c).strip()]
+    if not wanted:
+        return {}
+    # Batch request: q=sh000001,sz399001
+    tx_syms = [_index_code_to_tx(c) for c in wanted]
+    url = "https://qt.gtimg.cn/q=" + ",".join(tx_syms)
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        configure_akshare_environment()
+        with urllib.request.urlopen(url, timeout=READ_TIMEOUT) as resp:
+            raw = resp.read()
+        text = ""
+        for encoding in ("gbk", "gb18030", "utf-8"):
+            try:
+                text = raw.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+        if not text:
+            return {}
+        for chunk in text.replace("\r", "").split(";\n"):
+            chunk = chunk.strip().rstrip(";")
+            if not chunk or "=" not in chunk or "~" not in chunk:
+                continue
+            try:
+                payload = chunk.split("=", 1)[1].strip().strip(";")
+                if payload.startswith('"') and payload.endswith('"'):
+                    payload = payload[1:-1]
+                parts = payload.split("~")
+            except (IndexError, ValueError):
+                continue
+            if len(parts) < 6:
+                continue
+            code = str(parts[2]).strip()
+            try:
+                price = float(parts[3]) if parts[3] else None
+            except ValueError:
+                price = None
+            if price is None:
+                continue
+
+            def _f(idx: int) -> float | None:
+                if idx >= len(parts) or parts[idx] in ("", None):
+                    return None
+                try:
+                    return float(parts[idx])
+                except ValueError:
+                    return None
+
+            amount = None
+            # field 35 like "price/volume/amount"
+            if len(parts) > 35 and "/" in parts[35]:
+                segs = parts[35].split("/")
+                if len(segs) >= 3:
+                    try:
+                        amount = float(segs[2])
+                    except ValueError:
+                        amount = None
+            if amount is None:
+                amount = _f(37)
+                if amount is not None and amount < 1e10:
+                    amount = amount * 10000.0
+
+            qt = str(parts[30]) if len(parts) > 30 else ""
+            if len(qt) >= 12 and qt.isdigit():
+                quote_time = f"{qt[0:4]}-{qt[4:6]}-{qt[6:8]} {qt[8:10]}:{qt[10:12]}"
+            else:
+                quote_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+            out[code] = {
+                "available": True,
+                "kind": "index",
+                "code": code,
+                "name": parts[1].strip() if parts[1] else code,
+                "price": price,
+                "change_pct": _f(32),
+                "change_amount": _f(31),
+                "open": _f(5),
+                "high": _f(33),
+                "low": _f(34),
+                "prev_close": _f(4),
+                "volume": _f(36) or _f(6),
+                "amount": amount,
+                "turnover_rate": None,
+                "quote_time": quote_time,
+                "source": "tencent_gtimg",
+            }
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        return {}
+    return out
+
+
+def fetch_index_spot_with_fallback(
+    needed_codes: list[str] | None = None,
+) -> tuple[pd.DataFrame | None, dict[str, dict[str, Any]]]:
+    """East Money index spot first (with retry), then Tencent fill for missing codes."""
+    needed = [str(c).strip() for c in (needed_codes or ["000001", "399001", "399006"])]
+    em_df: pd.DataFrame | None = None
+    try:
+        em_df = fetch_index_spot_em()
+        if em_df is not None and not em_df.empty:
+            present = {str(r).strip() for r in em_df.get("代码", pd.Series(dtype=str)).astype(str)}
+            missing = [c for c in needed if c not in present]
+            if not missing:
+                return em_df, {}
+            tx = fetch_index_quotes_tencent(missing)
+            return em_df, tx
+    except Exception:
+        em_df = None
+    tx = fetch_index_quotes_tencent(needed)
+    return em_df, tx
 
 
 def fetch_intraday_em(symbol: str) -> pd.DataFrame:
@@ -330,6 +457,63 @@ def _ths_cookie_headers() -> dict[str, str]:
         ),
         "Cookie": f"v={v_code}",
     }
+
+
+def fetch_board_index_hist(
+    *,
+    board_type: str,
+    symbol: str,
+    start_date: str,
+    end_date: str,
+) -> pd.DataFrame:
+    """
+    板块指数日线。默认同花顺优先（东财板指数在本环境常被拦且超时），
+    失败再试东财。区间排行批量调用时不走 REQUEST_DELAY。
+    """
+    configure_akshare_environment()
+    name = (symbol or "").strip()
+    if not name:
+        return pd.DataFrame()
+    kind = (board_type or "industry").strip().lower()
+
+    # Tonghuashun first
+    try:
+        if kind == "concept":
+            df = ak.stock_board_concept_index_ths(
+                symbol=name, start_date=start_date, end_date=end_date
+            )
+        else:
+            df = ak.stock_board_industry_index_ths(
+                symbol=name, start_date=start_date, end_date=end_date
+            )
+        if df is not None and not df.empty:
+            return df
+    except Exception:  # noqa: BLE001
+        pass
+
+    # East Money fallback
+    try:
+        if kind == "concept":
+            df = ak.stock_board_concept_hist_em(
+                symbol=name,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                adjust="",
+            )
+        else:
+            df = ak.stock_board_industry_hist_em(
+                symbol=name,
+                start_date=start_date,
+                end_date=end_date,
+                period="日k",
+                adjust="",
+            )
+        if df is not None and not df.empty:
+            return df
+    except Exception:  # noqa: BLE001
+        pass
+    return pd.DataFrame()
 
 
 def fetch_ths_industry_board_summary() -> list[dict[str, Any]]:

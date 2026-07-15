@@ -13,8 +13,14 @@ from modules.data_timestamps import _now_label, collect_reference_meta, symbol_d
 from modules.portfolio import get_holding, list_holdings
 from modules.runtime_cache import get_or_set
 from modules.sector_data import build_sector_pick_summary, collect_sector_rankings
+from modules.sector_period import (
+    build_sector_period_rank,
+    infer_sector_lookback_trading_days,
+    wants_sector_period_rank,
+)
 
 _SECTOR_CACHE_TTL = 120.0
+_SECTOR_PERIOD_CACHE_TTL = 1800.0  # 区间榜拉取成本高，半小时复用
 _MARKET_CACHE_TTL = 60.0
 
 _CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
@@ -188,6 +194,9 @@ class QueryPlan:
     workflow: str = ""
     wants_sector_pick: bool = False
     matched_sectors: list[str] = field(default_factory=list)
+    # 区间板块排行：由语义窗口（如近两周）驱动，需拉指数并计算
+    sector_lookback_days: int | None = None
+    wants_sector_period_rank: bool = False
     needs_charts: bool = False
     chart_kinds: list[str] = field(default_factory=list)
     research_mode: str = ""
@@ -289,6 +298,23 @@ def plan_query(message: str, selected: list[str] | None = None) -> QueryPlan:
         # 段式问答可不拉板块广度
         plan.needs_sectors = False
 
+    lookback = infer_sector_lookback_trading_days(msg)
+    plan.sector_lookback_days = lookback
+    plan.wants_sector_period_rank = wants_sector_period_rank(msg, lookback=lookback)
+    if plan.wants_sector_period_rank:
+        plan.needs_sectors = True
+        plan.sector_only = plan.sector_only or not plan.symbols
+        # 区间排行 ≠ 板块优选：清掉 sector_research，避免 TA 扫描/重型编排
+        if not plan.wants_sector_pick:
+            plan.research_mode = ""
+            if plan.workflow in ("", "question_deep_dive", "named_symbols", "sector_research"):
+                plan.workflow = "sector_deep_dive"
+        else:
+            if not plan.workflow or plan.workflow in ("question_deep_dive", "named_symbols"):
+                plan.workflow = "sector_deep_dive"
+            if not plan.research_mode:
+                plan.research_mode = "sector_research"
+
     plan.keywords = list(dict.fromkeys(plan.keywords))[:12]
     return plan
 
@@ -359,6 +385,8 @@ def fetch_data_for_plan(
         "research_mode": plan.research_mode,
         "wants_sector_pick": plan.wants_sector_pick,
         "matched_sectors": plan.matched_sectors,
+        "sector_lookback_days": plan.sector_lookback_days,
+        "wants_sector_period_rank": plan.wants_sector_period_rank,
         "semantic_source": plan.semantic_source,
         "intent_summary": plan.intent_summary,
         "semantic_confidence": plan.semantic_confidence,
@@ -384,9 +412,13 @@ def fetch_data_for_plan(
             lambda: collect_market_context(refresh_breadth=refresh_breadth),
         )
         index_live = get_live_quote("INDEX.SH000001")
-        if index_live and index_live.get("available"):
+        index_live_sz = get_live_quote("INDEX.SZ399001")
+        if (index_live and index_live.get("available")) or (index_live_sz and index_live_sz.get("available")):
             market = dict(market)
-            market["index_live"] = index_live
+            if index_live and index_live.get("available"):
+                market["index_live"] = index_live
+            if index_live_sz and index_live_sz.get("available"):
+                market["index_live_sz"] = index_live_sz
         payload["market"] = market
 
     if want_sectors:
@@ -398,7 +430,10 @@ def fetch_data_for_plan(
         payload["sectors"] = sectors
         want_picks = (
             plan.wants_sector_pick
-            or plan.research_mode == "sector_research"
+            or (
+                plan.research_mode == "sector_research"
+                and not plan.wants_sector_period_rank
+            )
             or plan.workflow == "ta_screen"
             or bool(sf.get("sector_picks"))
         )
@@ -408,6 +443,26 @@ def fetch_data_for_plan(
                 _SECTOR_CACHE_TTL,
                 lambda: build_sector_pick_summary(sectors),
             )
+        want_period = plan.wants_sector_period_rank or bool(sf.get("sector_period_rank"))
+        lookback = plan.sector_lookback_days
+        if want_period and not lookback:
+            lookback = infer_sector_lookback_trading_days(message) or 10
+        if want_period and lookback:
+            concept_heavy = "概念" in (message or "") or "题材" in (message or "")
+            days = int(lookback)
+            # 默认只算行业全量；点名概念/题材再加样本（同花顺概念指数冷启动很慢）
+            c_limit = 20 if concept_heavy else 0
+            cache_key = f"data:sector_period:{days}:c{c_limit}"
+            payload["sector_period_rank"] = get_or_set(
+                cache_key,
+                _SECTOR_PERIOD_CACHE_TTL,
+                lambda d=days, lim=c_limit: build_sector_period_rank(
+                    sectors,
+                    trading_days=d,
+                    include_concepts=lim > 0,
+                    concept_limit=lim,
+                ),
+            )
 
     needs_participant = (
         want_sectors
@@ -416,6 +471,9 @@ def fetch_data_for_plan(
         or "capital_flow" in plan.intents
         or plan.wants_sector_pick
     )
+    # 纯区间排行不拉参与者资金流，减负
+    if plan.wants_sector_period_rank and not plan.wants_sector_pick and "capital_flow" not in plan.intents:
+        needs_participant = False
     if needs_participant:
         from modules.participant_flow import collect_market_participant_context
 
@@ -432,24 +490,18 @@ def fetch_data_for_plan(
         ]
         payload["participant_flow"] = collect_market_participant_context(sector_keywords=kws)
 
-    # 研报/财报：语义 fetch 优先；否则按 research_mode
-    need_research = (
-        bool(sf.get("research_reports"))
-        if sf
-        else (
-            plan.research_mode == "symbol_research"
-            and plan.workflow != "news_pulse"
-            and bool(symbols)
-            and not plan.sector_only
-        )
+    # 研报/财报：规则保底（个股深研必拉）∪ 语义 fetch 开关（语义关了也不能关掉深研保底）
+    rule_symbol_research = (
+        plan.research_mode == "symbol_research"
+        and plan.workflow != "news_pulse"
+        and bool(symbols)
+        and not plan.sector_only
     )
+    need_research = rule_symbol_research or bool(sf.get("research_reports"))
     need_fundamentals = (
-        bool(sf.get("fundamentals"))
-        if sf
-        else (
-            need_research
-            or (plan.workflow == "ta_screen" and bool(symbols) and not plan.sector_only)
-        )
+        rule_symbol_research
+        or bool(sf.get("fundamentals"))
+        or (plan.workflow == "ta_screen" and bool(symbols) and not plan.sector_only)
     )
     if need_research and symbols and not plan.sector_only:
         from modules.research_reports import collect_research_for_symbols
@@ -555,11 +607,26 @@ def compact_payload_for_llm(data: dict[str, Any]) -> dict[str, Any]:
         "data_reference",
         "market",
         "sector_picks",
+        "sector_period_rank",
         "participant_flow",
         "symbols",
     ):
         if key in data:
             out[key] = data[key]
+
+    period = out.get("sector_period_rank")
+    if isinstance(period, dict) and period.get("available"):
+        out["sector_period_rank"] = {
+            "available": True,
+            "trading_days": period.get("trading_days"),
+            "window": period.get("window"),
+            "note": period.get("note"),
+            "source": period.get("source"),
+            "scanned": period.get("scanned"),
+            "ok": period.get("ok"),
+            "top_losers": (period.get("top_losers") or [])[:12],
+            "top_gainers": (period.get("top_gainers") or [])[:8],
+        }
 
     sectors = data.get("sectors")
     if sectors:

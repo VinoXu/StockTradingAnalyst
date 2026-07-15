@@ -31,6 +31,7 @@ from modules.env_loader import load_env
 from modules.llm import llm_available, llm_config, llm_setup_hint
 from modules.portfolio import add_holding, ensure_holding_name, portfolio_summary, remove_holding
 from modules.realtime_quotes import get_live_quotes, is_a_share_trading_hours
+from modules.selection_store import get_selection, save_selection
 from modules.ui_log import load_ui_events, log_ui_event
 
 load_env()
@@ -59,6 +60,11 @@ class HoldingsBatchReq(BaseModel):
 
 class SyncReq(BaseModel):
     symbols: list[str]
+
+
+class SelectionReq(BaseModel):
+    symbols: list[str] = []
+    explicit: bool = True
 
 
 class SettingsReq(BaseModel):
@@ -406,6 +412,19 @@ def holdings_add_batch(req: HoldingsBatchReq, background_tasks: BackgroundTasks)
 def holdings_remove(code: str) -> dict[str, Any]:
     ok = remove_holding(code.strip())
     return {"ok": ok}
+
+
+@app.get("/api/selection")
+def selection_get() -> dict[str, Any]:
+    """Checked analysis symbols — stored in local SQLite (not browser)."""
+    data = get_selection()
+    return {"ok": True, **data}
+
+
+@app.put("/api/selection")
+def selection_put(req: SelectionReq) -> dict[str, Any]:
+    data = save_selection(req.symbols, explicit=req.explicit)
+    return {"ok": True, **data}
 
 
 @app.post("/api/sync")

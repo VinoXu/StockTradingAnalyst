@@ -63,7 +63,8 @@ const contextLimitText = document.getElementById('contextLimitText');
 const contextLimitNewChat = document.getElementById('contextLimitNewChat');
 
 let holdings = [];
-let selected = loadSelected();
+let selected = [];
+let selectionExplicit = false;
 let pickerDraft = [];
 let chatTurns = [];
 let sending = false;
@@ -81,7 +82,7 @@ let currentSessionId = null;
 let loadedSessionId = null;
 const chartInstances = new Map();
 
-function loadSelected() {
+function readLegacyLocalSelected() {
   try {
     return JSON.parse(localStorage.getItem(LS_SELECTED) || '[]');
   } catch {
@@ -89,12 +90,19 @@ function loadSelected() {
   }
 }
 
+function clearLegacyLocalSelection() {
+  try {
+    localStorage.removeItem(LS_SELECTED);
+    localStorage.removeItem(LS_SELECTED_EXPLICIT);
+  } catch { /* ignore */ }
+}
+
 function isSelectionExplicit() {
-  return localStorage.getItem(LS_SELECTED_EXPLICIT) === '1';
+  return !!selectionExplicit;
 }
 
 function markSelectionExplicit() {
-  localStorage.setItem(LS_SELECTED_EXPLICIT, '1');
+  selectionExplicit = true;
 }
 
 /** 与持仓对齐：仅剔除已删除标的；未手动选过且为空时才默认全选 */
@@ -107,9 +115,40 @@ function syncSelectedWithHoldings() {
   }
 }
 
-function saveSelected() {
-  localStorage.setItem(LS_SELECTED, JSON.stringify(selected));
+async function persistSelection() {
   updateSelectedSummary();
+  try {
+    await api('/api/selection', {
+      method: 'PUT',
+      body: JSON.stringify({ symbols: selected, explicit: selectionExplicit }),
+    });
+  } catch (e) {
+    console.warn('persist selection failed', e);
+  }
+}
+
+function saveSelected() {
+  void persistSelection();
+}
+
+async function loadSelectionFromServer() {
+  try {
+    const data = await api('/api/selection');
+    selected = Array.isArray(data.symbols) ? data.symbols : [];
+    selectionExplicit = !!data.explicit;
+    const legacy = readLegacyLocalSelected();
+    const legacyExplicit = localStorage.getItem(LS_SELECTED_EXPLICIT) === '1';
+    // 首次迁移：本机库为空时，把旧浏览器勾选写入 SQLite
+    if (!selected.length && !selectionExplicit && (legacy.length || legacyExplicit)) {
+      selected = legacy;
+      selectionExplicit = legacyExplicit || legacy.length > 0;
+      await persistSelection();
+    }
+    clearLegacyLocalSelection();
+  } catch {
+    selected = readLegacyLocalSelected();
+    selectionExplicit = localStorage.getItem(LS_SELECTED_EXPLICIT) === '1';
+  }
 }
 
 function toast(msg, type = 'info') {
@@ -1245,6 +1284,7 @@ document.getElementById('listClearAll').addEventListener('click', () => {
 
 (async () => {
   await refreshStatus();
+  await loadSelectionFromServer();
   await loadHoldings();
   await initChatSession();
   startLivePoll();

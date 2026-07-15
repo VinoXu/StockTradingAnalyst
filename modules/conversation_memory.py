@@ -152,7 +152,12 @@ def build_memory_block(
     if not summary:
         return "", False
 
-    block = f"【对话记忆】\n本 session 历史提炼：{summary}"
+    block = (
+        "【对话记忆·背景备忘·勿写成接龙复盘】\n"
+        "以下只是本会话背景，用户未必记得细节；请把本轮写成一份独立、完整、自洽的答复，"
+        "不要用「上次咱们说到」之类口吻。\n"
+        f"历史提炼：{summary}"
+    )
     was_truncated = len(block) > MEMORY_BLOCK_LIMIT
     if was_truncated:
         block = block[:MEMORY_BLOCK_LIMIT] + "…（记忆已截断）"

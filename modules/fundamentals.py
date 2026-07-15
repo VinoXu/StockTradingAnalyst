@@ -175,7 +175,7 @@ def fetch_symbol_fundamentals(symbol: str) -> dict[str, Any]:
         "valuation": value,
         "sina_profit": sina,
     }
-    if ths.get("available") and value.get("available"):
+    if ths.get("available") or value.get("available") or sina.get("available"):
         merged["highlights"] = _build_highlights(ths, value, sina)
     return merged
 
@@ -185,8 +185,8 @@ def _build_highlights(
     value: dict[str, Any],
     sina: dict[str, Any],
 ) -> dict[str, Any]:
-    t = ths.get("latest") or {}
-    v = (value.get("snapshot") or {})
+    t = (ths.get("latest") or {}) if ths.get("available") else {}
+    v = (value.get("snapshot") or {}) if value.get("available") else {}
     s = (sina.get("latest") or {}) if sina.get("available") else {}
     return {
         "period": t.get("period") or s.get("period"),
@@ -197,6 +197,7 @@ def _build_highlights(
         "gross_margin": t.get("gross_margin"),
         "roe": t.get("roe"),
         "debt_ratio": t.get("debt_ratio"),
+        "ocf_per_share": t.get("ocf_per_share"),
         "pe_ttm": v.get("pe_ttm"),
         "pb": v.get("pb"),
         "dividend_yield": v.get("dividend_yield"),

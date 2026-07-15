@@ -172,6 +172,8 @@ def _rule_hint_blob(plan: QueryPlan) -> dict[str, Any]:
         "matched_sectors": plan.matched_sectors,
         "needs_market": plan.needs_market,
         "needs_sectors": plan.needs_sectors,
+        "sector_lookback_days": plan.sector_lookback_days,
+        "wants_sector_period_rank": plan.wants_sector_period_rank,
     }
 
 
@@ -201,7 +203,8 @@ def _planner_system_prompt() -> str:
         '"workflow_hint":"参考工作流名（可留空）",'
         '"symbols":["600519"],'
         '"fetch":{"quotes":true,"research_reports":false,"fundamentals":false,'
-        '"news":false,"holdings":false,"sectors":false,"sector_picks":false,"market":false},'
+        '"news":false,"holdings":false,"sectors":false,"sector_picks":false,'
+        '"sector_period_rank":false,"market":false,"lookback_trading_days":null},'
         '"agent_tasks":[{"agent_id":"murphy","skill":"ta-trend-structure","goal":"…"}],'
         '"team_lead_skills":["…"],'
         '"task_briefs":[{"id":"t1","goal":"…","depends_on":[]}]'
@@ -211,7 +214,9 @@ def _planner_system_prompt() -> str:
         "2. 轻问题少拆任务（1～3 Agent）；深研可多但仍应说明 goal。\n"
         "3. 若规则 workflow 与语义冲突，以语义为准并写 confidence。\n"
         "4. team_lead_skills 用于最终综合，2～5 个即可。\n"
-        "5. 禁止编造不存在的 agent/skill。"
+        "5. 禁止编造不存在的 agent/skill。\n"
+        "6. 用户问近一周/两周/N日板块涨跌排行：sectors=true 且 sector_period_rank=true，"
+        "lookback_trading_days 填交易日数（两周≈10）；勿只开 sector_picks。"
     )
 
 
@@ -299,10 +304,25 @@ def _apply_fetch_flags(plan: QueryPlan, fetch: dict[str, Any]) -> None:
         return
     if "market" in fetch:
         plan.needs_market = bool(fetch.get("market"))
-    if "sectors" in fetch or "sector_picks" in fetch:
-        plan.needs_sectors = bool(fetch.get("sectors") or fetch.get("sector_picks"))
+    if "sectors" in fetch or "sector_picks" in fetch or "sector_period_rank" in fetch:
+        plan.needs_sectors = bool(
+            fetch.get("sectors") or fetch.get("sector_picks") or fetch.get("sector_period_rank")
+        )
     if fetch.get("sector_picks"):
         plan.wants_sector_pick = True
+    if fetch.get("sector_period_rank"):
+        plan.wants_sector_period_rank = True
+        plan.needs_sectors = True
+    raw_lb = fetch.get("lookback_trading_days")
+    if raw_lb is not None:
+        try:
+            lb = int(raw_lb)
+            if 2 <= lb <= 60:
+                plan.sector_lookback_days = lb
+                plan.wants_sector_period_rank = True
+                plan.needs_sectors = True
+        except (TypeError, ValueError):
+            pass
     plan.semantic_fetch = {
         "quotes": bool(fetch.get("quotes", True)),
         "research_reports": bool(fetch.get("research_reports")),
@@ -311,7 +331,9 @@ def _apply_fetch_flags(plan: QueryPlan, fetch: dict[str, Any]) -> None:
         "holdings": bool(fetch.get("holdings")),
         "sectors": bool(fetch.get("sectors")),
         "sector_picks": bool(fetch.get("sector_picks")),
+        "sector_period_rank": bool(fetch.get("sector_period_rank") or plan.wants_sector_period_rank),
         "market": bool(fetch.get("market", plan.needs_market)),
+        "lookback_trading_days": plan.sector_lookback_days,
     }
 
 

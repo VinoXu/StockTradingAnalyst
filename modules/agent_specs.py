@@ -126,15 +126,64 @@ def should_persist_thesis(plan: QueryPlan) -> bool:
 # --- Evidence packs (fed to parallel Agent LLM calls) ---
 
 
+def _compact_market_for_agents(fetched: dict[str, Any]) -> dict[str, Any] | None:
+    """Slim market pack so Agents can conclude on breadth/index, not only stocks."""
+    market = fetched.get("market")
+    if not isinstance(market, dict) or not market:
+        return None
+    breadth = market.get("breadth") or {}
+    dow = market.get("dow") or {}
+    live = market.get("index_live") or {}
+    live_sz = market.get("index_live_sz") or {}
+    pack: dict[str, Any] = {}
+    if breadth.get("available"):
+        pack["breadth"] = {
+            "available": True,
+            "trade_date": breadth.get("trade_date"),
+            "rising_count": breadth.get("rising_count"),
+            "falling_count": breadth.get("falling_count"),
+            "limit_up": breadth.get("limit_up"),
+            "limit_down": breadth.get("limit_down"),
+            "bias": breadth.get("bias"),
+            "source_label": breadth.get("source_label"),
+        }
+    else:
+        pack["breadth"] = {"available": False}
+    pack["dow"] = {
+        "available": bool(dow.get("available")),
+        "state_cn": dow.get("state_cn"),
+        "notes": (dow.get("notes") or [])[:2],
+    }
+    if live.get("available") and live.get("price") is not None:
+        pack["index_live_sh"] = {
+            "name": live.get("name") or "上证指数",
+            "price": live.get("price"),
+            "change_pct": live.get("change_pct"),
+            "amount": live.get("amount"),
+            "as_of_label": live.get("as_of_label"),
+        }
+    if live_sz.get("available") and live_sz.get("price") is not None:
+        pack["index_live_sz"] = {
+            "name": live_sz.get("name") or "深证成指",
+            "price": live_sz.get("price"),
+            "change_pct": live_sz.get("change_pct"),
+            "amount": live_sz.get("amount"),
+            "as_of_label": live_sz.get("as_of_label"),
+        }
+    return pack
+
+
 def build_agent_evidence_symbol(fetched: dict[str, Any]) -> dict[str, Any]:
     symbols = fetched.get("symbols") or []
     research = fetched.get("research_reports") or {}
     fundamentals = fetched.get("fundamentals") or {}
+    market = _compact_market_for_agents(fetched)
     return {
         "nison": {
             "agent": "nison",
             "skills": list(NISON_SKILL_NAMES),
             "focus": "蜡烛图形态与信号汇合；使用 symbols[].candle_bars 计量字段",
+            "market": market,
             "symbols": [
                 {
                     "name": s.get("name") or s.get("symbol"),
@@ -148,7 +197,8 @@ def build_agent_evidence_symbol(fetched: dict[str, Any]) -> dict[str, Any]:
         "murphy": {
             "agent": "murphy",
             "skills": list(MURPHY_SKILL_NAMES),
-            "focus": "趋势结构、振荡指标、量价、价格形态",
+            "focus": "趋势结构、振荡指标、量价、价格形态；有 market 时必须先对大盘广度/指数表态",
+            "market": market,
             "symbols": [
                 {
                     "name": s.get("name") or s.get("symbol"),
@@ -160,14 +210,15 @@ def build_agent_evidence_symbol(fetched: dict[str, Any]) -> dict[str, Any]:
                 if s.get("available")
             ],
         },
-        "duan": _master_evidence("duan", research, fundamentals, symbols),
+        "duan": {**_master_evidence("duan", research, fundamentals, symbols), "market": market},
         "buffett": {
             **_master_evidence("buffett", research, fundamentals, symbols),
+            "market": market,
             "skill_extra": "symbol-earnings-review",
             "focus": "财务质量、估值安全边际；对照 profits/ROE/毛利率与研报 EPS",
         },
-        "munger": _master_evidence("munger", research, fundamentals, symbols),
-        "li": _master_evidence("li", research, fundamentals, symbols),
+        "munger": {**_master_evidence("munger", research, fundamentals, symbols), "market": market},
+        "li": {**_master_evidence("li", research, fundamentals, symbols), "market": market},
     }
 
 
@@ -189,31 +240,85 @@ def _master_evidence(
 def build_agent_evidence_sector(fetched: dict[str, Any]) -> dict[str, Any]:
     picks = fetched.get("sector_picks") or {}
     top = (picks.get("top_picks") or [])[:5]
+    weak = (picks.get("weak_boards") or [])[:8]
+    market = _compact_market_for_agents(fetched)
+    period = fetched.get("sector_period_rank") or {}
+    period_pack: dict[str, Any] | None = None
+    if isinstance(period, dict) and period.get("available"):
+        period_pack = {
+            "trading_days": period.get("trading_days"),
+            "window": period.get("window"),
+            "top_losers": (period.get("top_losers") or [])[:10],
+            "top_gainers": (period.get("top_gainers") or [])[:5],
+            "note": period.get("note"),
+        }
+    # 显式跌幅榜（当日口径），避免 Agent 只围绕优选板块打转
+    sectors = fetched.get("sectors") or {}
+    daily_losers: list[dict[str, Any]] = []
+    if isinstance(sectors, dict):
+        for key in ("industry", "concept"):
+            block = sectors.get(key) or {}
+            if isinstance(block, dict) and block.get("available"):
+                for row in (block.get("top_losers") or [])[:6]:
+                    if isinstance(row, dict):
+                        daily_losers.append(
+                            {
+                                "name": row.get("name"),
+                                "change_pct": row.get("change_pct"),
+                                "board_type": key,
+                            }
+                        )
+        daily_losers.sort(key=lambda r: float(r.get("change_pct") or 0))
+        daily_losers = daily_losers[:10]
+    if period_pack:
+        period_note = (
+            f"用户要区间排行：必须优先引用 sector_period_rank（近"
+            f"{period_pack.get('trading_days')}个交易日累计），禁止只用当日涨跌幅敷衍"
+        )
+    else:
+        period_note = "板块涨跌幅口径为最新交易日，不是近2周累计收益"
     return {
         "nison": {
             "agent": "nison",
             "skills": list(NISON_SKILL_NAMES),
             "focus": "板块领涨股蜡烛图形态",
             "sector_picks": top,
+            "daily_losers": daily_losers,
+            "sector_period_rank": period_pack,
+            "period_note": period_note,
+            "market": market,
         },
         "murphy": {
             "agent": "murphy",
             "skills": list(MURPHY_SKILL_NAMES),
-            "focus": "板块趋势、广度、量价",
+            "focus": "板块趋势、广度、量价；有区间榜时必须直接报 period losers",
             "sector_picks": top,
+            "weak_boards": weak,
+            "daily_losers": daily_losers,
+            "sector_period_rank": period_pack,
+            "period_note": period_note,
             "participant_flow": fetched.get("participant_flow"),
+            "market": market,
         },
         "munger": {
             "agent": "munger",
             "skill": "master-munger",
             "focus": "逆向：过热、广度差、独狼领涨、失败情景",
             "sector_picks": top,
+            "daily_losers": daily_losers,
+            "sector_period_rank": period_pack,
+            "period_note": period_note,
+            "market": market,
         },
         "li": {
             "agent": "li",
             "skill": "master-li",
             "focus": "产业趋势与长期确定性（无个股财报）",
             "sector_picks": top,
+            "daily_losers": daily_losers,
+            "sector_period_rank": period_pack,
+            "period_note": period_note,
+            "market": market,
         },
     }
 

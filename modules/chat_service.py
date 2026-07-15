@@ -14,7 +14,7 @@ from modules.agent_parallel import (
     run_parallel_agents,
 )
 from modules.agent_specs import agent_roster_for_plan, should_persist_thesis
-from modules.analysis_mandate import CORE_ANALYSIS_MANDATE
+from modules.analysis_mandate import CORE_ANALYSIS_MANDATE, USER_REPLY_STRUCTURE
 from modules.chart_builder import build_charts
 from modules.chat_history import (
     append_turn,
@@ -279,7 +279,11 @@ def _compose_user_message(
     memory_block: str,
     fetched: dict,
 ) -> str:
-    parts: list[str] = [CORE_ANALYSIS_MANDATE, build_cot_instruction(fetched)]
+    parts: list[str] = [
+        CORE_ANALYSIS_MANDATE,
+        USER_REPLY_STRUCTURE,
+        build_cot_instruction(fetched),
+    ]
     if memory_block:
         parts.append(memory_block)
 
@@ -298,7 +302,7 @@ def _compose_user_message(
         if labels:
             portfolio_hint = (
                 f"【分析范围】用户已勾选：{'、'.join(labels)}。"
-                "请逐只（或按组合对比）分析这些标的的走势、技术状态与关注点；"
+                "请逐只（或按组合对比）说明这些标的现在怎么看；"
                 "以这些标的为主作答，不要写成全市/全行业复盘。"
                 "仅当用户明确问大盘或板块时，才用一两句概括环境。"
             )
@@ -392,11 +396,9 @@ def _compose_user_message(
     parts.append(
         "【用户问题】\n"
         f"{message}\n\n"
-        "请基于 Skill 判据 + 本轮检索数据 + 对话记忆回答；"
-        "必须给出向前看的趋势/机会判断与尚未兑现的风险，不要当行情播报；"
-        "语言简单直白；禁止 Markdown；"
-        "若 live_quote 有盘中价先报现价；技术指标说明日K截止日；"
-        "全文最后按【收尾态度】给出可执行的仓位观点。"
+        "请严格按【对用户说话】要求作答：先汇总结论，再自然写技术/资金/框架与理论依据，最后风险失效；"
+        "写成连贯口语，禁止输出【……】框架小标题；禁止 Markdown；禁止内部黑话。"
+        "若 live_quote 有盘中价可在开篇结论里顺带说明；日K指标注明截止日。"
         + (f"\n{sector_hint}" if sector_hint else "")
     )
     return "\n\n".join(parts)
@@ -411,15 +413,21 @@ def _should_run_parallel_agents(plan) -> bool:
 
 
 def _team_lead_extra_parts(fetched: dict, message: str) -> list[str]:
-    parts: list[str] = [CORE_ANALYSIS_MANDATE, build_cot_instruction(fetched)]
+    parts: list[str] = [
+        CORE_ANALYSIS_MANDATE,
+        USER_REPLY_STRUCTURE,
+        build_cot_instruction(fetched),
+    ]
     if fetched.get("intent_summary"):
-        parts.append(f"【语义规划意图】{fetched.get('intent_summary')}")
+        parts.append(
+            "【内部任务备忘·勿写入用户正文】"
+            f"本轮意图摘要：{fetched.get('intent_summary')}"
+        )
     briefs = fetched.get("task_briefs") or []
     if briefs:
         parts.append(
-            "【任务拆分】\n```json\n"
+            "【内部任务备忘·勿写入用户正文】任务拆分仅供你综合，禁止复述 JSON：\n"
             + json.dumps(briefs, ensure_ascii=False, indent=2, default=str)[:4000]
-            + "\n```"
         )
     wf = fetched.get("workflow") or ""
     hint = _WORKFLOW_HINTS.get(wf)
@@ -665,7 +673,7 @@ def _prepare_ask_llm(
                 fetched=fetched,
                 agent_cards=kept,
                 memory_block=slim_memory,
-                extra_parts=[CORE_ANALYSIS_MANDATE],
+                extra_parts=[CORE_ANALYSIS_MANDATE, USER_REPLY_STRUCTURE],
                 scoreboard=board,
                 thin_sheet="",
             )

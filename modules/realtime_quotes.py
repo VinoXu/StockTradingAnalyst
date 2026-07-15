@@ -11,7 +11,11 @@ from typing import Any
 
 import pandas as pd
 
-from modules.akshare_client import fetch_a_spot_em, fetch_index_spot_em, fetch_intraday_em
+from modules.akshare_client import (
+    fetch_a_spot_em,
+    fetch_index_spot_with_fallback,
+    fetch_intraday_em,
+)
 from modules.data_fetcher import _normalize_symbol, _symbol_to_ak_code
 from modules.portfolio import get_holding
 from modules.ta_analysis import load_snapshot
@@ -193,16 +197,38 @@ def _refresh_index_cache(force: bool = False) -> dict[str, dict[str, Any]]:
             return _index_by_code
 
     fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M")
-    df = fetch_index_spot_em()
+    needed = list(dict.fromkeys(_INDEX_MAP.values()))
+    em_df, tx_fill = fetch_index_spot_with_fallback(needed)
     by_code: dict[str, dict[str, Any]] = {}
-    for _, row in df.iterrows():
-        code = str(row.get("代码") or "")
-        by_code[code] = _spot_row_to_quote(row, fetched_at=fetched_at, kind="index")
+    if em_df is not None and not em_df.empty:
+        for _, row in em_df.iterrows():
+            code = str(row.get("代码") or "")
+            if not code:
+                continue
+            by_code[code] = _spot_row_to_quote(row, fetched_at=fetched_at, kind="index")
+
+    session = _session_label()
+    for code, quote in tx_fill.items():
+        # Prefer East Money when already present; Tencent only fills gaps
+        if code in by_code and by_code[code].get("available"):
+            continue
+        q = dict(quote)
+        q["as_of_label"] = _as_of_label(q.get("quote_time") or fetched_at, session)
+        q["granularity"] = "intraday"
+        q["session"] = session
+        by_code[code] = q
 
     with _lock:
-        _index_by_code = by_code
-        _index_ts = time.time()
-    return by_code
+        if by_code:
+            _index_by_code = by_code
+            _index_ts = time.time()
+        # Keep previous cache if both sources failed this round
+        elif _index_by_code:
+            return _index_by_code
+        else:
+            _index_by_code = {}
+            _index_ts = time.time()
+    return _index_by_code
 
 
 def get_live_quote(symbol: str, *, force_refresh: bool = False) -> dict[str, Any] | None:

@@ -16,7 +16,9 @@ from modules.skill_loader import load_skill
 _AGENT_JSON_SCHEMA = (
     '输出仅一行 JSON，不要 Markdown：'
     '{"agent":"名称","score":1-5,"stance":"偏多观察|观望|降权",'
-    '"bullets":["…","…"],"falsify":["若…则作废"],"confidence":"A|B|C"}'
+    '"bullets":["…","…"],"falsify":["若…则作废"],"confidence":"A|B|C"}。'
+    'bullets 必须是可写进最终结论的依据句（含关键数字或明确「未核实」），'
+    '禁止只写「数据不全/无法判断」；有 market/fundamentals 字段时必须各至少用到其中 1 条。'
 )
 
 _MAX_KEEP_CARDS = 4
@@ -212,8 +214,99 @@ def rank_and_filter_agent_cards(
 
 
 def build_thin_fact_sheet(fetched: dict[str, Any]) -> str:
-    """Conclusion-only headlines for Team Lead; never raw evidence packs."""
+    """Conclusion-only headlines for Team Lead; never raw process packs."""
     lines: list[str] = ["【极瘦结论摘要】"]
+
+    market = fetched.get("market")
+    if isinstance(market, dict) and market:
+        bits: list[str] = []
+        breadth = market.get("breadth") or {}
+        if breadth.get("available"):
+            bits.append(
+                f"涨跌家数 涨{breadth.get('rising_count')}/跌{breadth.get('falling_count')}"
+                f"（{breadth.get('trade_date') or '—'}）"
+            )
+        else:
+            bits.append("涨跌家数：本轮未核实")
+        for key, label in (("index_live", "上证"), ("index_live_sz", "深证")):
+            live = market.get(key) or {}
+            if live.get("available") and live.get("price") is not None:
+                chg = live.get("change_pct")
+                chg_txt = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else str(chg or "—")
+                bits.append(f"{label}{live.get('price')}（{chg_txt}，{live.get('as_of_label') or '盘中'}）")
+            else:
+                bits.append(f"{label}盘中价：本轮未核实")
+        dow = market.get("dow") or {}
+        if dow.get("available"):
+            bits.append(f"双指数结构：{dow.get('state_cn') or dow.get('state')}")
+            for note in (dow.get("notes") or [])[:2]:
+                if note:
+                    bits.append(str(note)[:60])
+        else:
+            bits.append(f"双指数历史日K：{dow.get('state_cn') or '缺失'}")
+        lines.append("- 大盘: " + "；".join(bits))
+
+    # 优先：语义驱动的区间累计收益榜；否则退回「最新交易日」跌幅
+    sector_bits: list[str] = []
+    period = fetched.get("sector_period_rank") or {}
+    if isinstance(period, dict) and period.get("available"):
+        days = period.get("trading_days") or "?"
+        window = period.get("window") or ""
+        losers = (period.get("top_losers") or [])[:10]
+        parts = []
+        for row in losers:
+            if not isinstance(row, dict):
+                continue
+            name = row.get("name") or "?"
+            pct = row.get("period_return_pct")
+            pct_txt = f"{pct:+.2f}%" if isinstance(pct, (int, float)) else str(pct or "—")
+            parts.append(f"{name}{pct_txt}")
+        if parts:
+            sector_bits.append(
+                f"近{days}个交易日跌幅榜"
+                + (f"（{window}）" if window else "")
+                + ": "
+                + "、".join(parts)
+            )
+            sector_bits.append("口径=板块指数区间累计收益（已按语义计算，非单日涨跌幅）")
+    else:
+        picks = fetched.get("sector_picks") or {}
+        weak = (picks.get("weak_boards") or [])[:8] if isinstance(picks, dict) else []
+        if weak:
+            parts = []
+            for row in weak:
+                if not isinstance(row, dict):
+                    continue
+                name = row.get("name") or "?"
+                pct = row.get("change_pct")
+                pct_txt = f"{pct:+.2f}%" if isinstance(pct, (int, float)) else str(pct or "—")
+                parts.append(f"{name}{pct_txt}")
+            if parts:
+                sector_bits.append("今日跌幅靠前: " + "、".join(parts))
+        else:
+            sectors = fetched.get("sectors") or {}
+            merged_losers: list[dict[str, Any]] = []
+            if isinstance(sectors, dict):
+                for key in ("industry", "concept"):
+                    block = sectors.get(key) or {}
+                    if not isinstance(block, dict) or not block.get("available"):
+                        continue
+                    for row in (block.get("top_losers") or [])[:5]:
+                        if isinstance(row, dict):
+                            merged_losers.append(row)
+                merged_losers.sort(key=lambda r: float(r.get("change_pct") or 0))
+                parts = []
+                for row in merged_losers[:8]:
+                    name = row.get("name") or "?"
+                    pct = row.get("change_pct")
+                    pct_txt = f"{pct:+.2f}%" if isinstance(pct, (int, float)) else str(pct or "—")
+                    parts.append(f"{name}{pct_txt}")
+                if parts:
+                    sector_bits.append("今日跌幅靠前: " + "、".join(parts))
+        if sector_bits:
+            sector_bits.append("口径=最新交易日涨跌幅（本轮未触发区间累计计算）")
+    if sector_bits:
+        lines.append("- 板块: " + "；".join(sector_bits))
 
     for s in (fetched.get("symbols") or [])[:3]:
         if not isinstance(s, dict) or not s.get("available", True):
@@ -239,20 +332,32 @@ def build_thin_fact_sheet(fetched: dict[str, Any]) -> str:
             continue
         warns = ((row.get("rigor") or {}).get("warnings") or [])[:2]
         hl = row.get("highlights")
+        if not isinstance(hl, dict):
+            hl = ((row.get("ths_abstract") or {}).get("latest") or {}) if row.get("available") else {}
         hl_bits: list[str] = []
         if isinstance(hl, dict):
-            for k in ("roe", "pe", "gross_margin", "revenue_yoy"):
-                if hl.get(k) is not None:
-                    hl_bits.append(f"{k}={hl.get(k)}")
+            label_map = (
+                ("roe", "ROE"),
+                ("debt_ratio", "资产负债率"),
+                ("ocf_per_share", "每股经营现金流"),
+                ("gross_margin", "毛利率"),
+                ("revenue_yoy", "营收同比"),
+                ("pe_ttm", "PE_TTM"),
+            )
+            for key, label in label_map:
+                if hl.get(key) is not None:
+                    hl_bits.append(f"{label}={hl.get(key)}")
         elif isinstance(hl, list):
             hl_bits = [str(x)[:40] for x in hl[:2]]
         parts = []
         if hl_bits:
-            parts.append(",".join(hl_bits)[:80])
+            parts.append(",".join(hl_bits)[:120])
         if warns:
             parts.append("警示:" + ";".join(str(w)[:40] for w in warns))
         if parts:
             lines.append(f"- 财务要点({row.get('symbol')}): {'；'.join(parts)}")
+        elif row.get("available") is False:
+            lines.append(f"- 财务要点({row.get('symbol')}): 本轮未拉到可用财务摘要")
 
     for note in (fetched.get("thesis_drift_notes") or [])[:2]:
         if note:
@@ -322,9 +427,12 @@ def build_team_lead_user_blob(
 
     parts.append(
         f"【用户问题】\n{message}\n\n"
-        "你是 Team Lead：综合评分看板与筛选后的 Agent 评分卡，结合极瘦结论摘要，"
-        "输出最终口语结论。必须写矛盾点、证伪条件、偏多观察/观望/降权；"
-        "禁止 Markdown；禁止复述 Agent JSON；禁止索要或假设未给出的原始明细数据。"
+        "你是最终执笔人：用户看不到 Agent 过程。把评分看板与评分卡消化成连贯口语答复——"
+        "先说清汇总结论，再自然写技术指标、资金行为、分析框架与理论依据，最后写风险与失效；"
+        "不要输出任何【……】框架小标题，不要像填表。立场用偏多观察/观望/降权。"
+        "极瘦摘要里若已有涨跌家数、指数结构、财务数字，必须当作已核实依据写进结论，"
+        "禁止再说「关键大盘/财务数据没抓全」之类空话；只有摘要明确写「本轮未核实」的项才可声明缺数。"
+        "禁止 Markdown；禁止复述 Agent JSON；禁止提内部协作过程；禁止编造未给出的数据。"
     )
     return "\n\n".join(parts)
 
@@ -344,8 +452,9 @@ def build_team_lead_messages(
     # Skill 正文只给各并行 Agent；Lead 只做评分卡综合，不注入 Skill 全文
     lead_scope = (
         f"{scope_note}\n"
-        "你是 Team Lead：依据各 Agent 已完成的评分卡做最终综合，"
-        "不要重新套用 Skill 原文；Skill 判据已由各 Agent 消化在评分卡中。"
+        "你是给用户写最终答案的人：把各 Agent 评分卡当成内部素材消化掉，"
+        "不要提 Agent、评分卡、协作过程；按总分逻辑写成连贯口语——"
+        "先结论，后依据（技术、资金、框架与理论），再风险；不要套【小标题】。"
         f"（本轮 workflow={getattr(plan, 'workflow', '') or '—'}）"
     ).strip()
     system = build_chat_system_prompt(skill_names=(), scope_note=lead_scope)

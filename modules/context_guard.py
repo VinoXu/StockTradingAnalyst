@@ -63,6 +63,10 @@ def trim_fetched_aggressive(data: dict) -> dict:
     if isinstance(picks, dict):
         picks["top_picks"] = (picks.get("top_picks") or [])[:3]
         picks["weak_boards"] = (picks.get("weak_boards") or [])[:2]
+    period = out.get("sector_period_rank")
+    if isinstance(period, dict):
+        period["top_losers"] = (period.get("top_losers") or [])[:8]
+        period["top_gainers"] = (period.get("top_gainers") or [])[:5]
     syms = out.get("symbols")
     if isinstance(syms, list):
         for sym in syms:
