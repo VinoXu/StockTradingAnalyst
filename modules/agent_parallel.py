@@ -308,10 +308,18 @@ def build_thin_fact_sheet(fetched: dict[str, Any]) -> str:
     if sector_bits:
         lines.append("- 板块: " + "；".join(sector_bits))
 
-    for s in (fetched.get("symbols") or [])[:3]:
-        if not isinstance(s, dict) or not s.get("available", True):
+    for s in (fetched.get("symbols") or [])[:5]:
+        if not isinstance(s, dict):
             continue
         name = s.get("name") or s.get("symbol") or "?"
+        code = (s.get("symbol") or "").split(".")[0] or "?"
+        if not s.get("available", True):
+            err = (s.get("error") or "本轮未核实到可用行情").strip()
+            lines.append(f"- {name}({code}): 数据不可用 — {err}")
+            lines.append(
+                "  （对用户须原样说明上述失败原因；禁止改口成「建议确认是否为A股」等猜测）"
+            )
+            continue
         bits = [f"regime={s.get('trend_regime') or '—'}", f"osc={s.get('osc_bias') or '—'}"]
         if s.get("capital_flow_note"):
             bits.append(f"资金={str(s.get('capital_flow_note'))[:40]}")
@@ -428,10 +436,13 @@ def build_team_lead_user_blob(
     parts.append(
         f"【用户问题】\n{message}\n\n"
         "你是最终执笔人：用户看不到 Agent 过程。把评分看板与评分卡消化成连贯口语答复——"
-        "先说清汇总结论，再自然写技术指标、资金行为、分析框架与理论依据，最后写风险与失效；"
+        "紧扣本轮问题：问什么答什么，给专业深度而非空泛概述；"
+        "开篇直接给本问题结论，再按需要展开证据与机制；技术/资金等用得上再写，勿为凑结构灌水；"
         "不要输出任何【……】框架小标题，不要像填表。立场用偏多观察/观望/降权。"
         "极瘦摘要里若已有涨跌家数、指数结构、财务数字，必须当作已核实依据写进结论，"
         "禁止再说「关键大盘/财务数据没抓全」之类空话；只有摘要明确写「本轮未核实」的项才可声明缺数。"
+        "若摘要写明某标的「数据不可用」及原因，开篇必须如实告知该原因，"
+        "禁止改口成「建议确认是否为A股」等猜测。"
         "禁止 Markdown；禁止复述 Agent JSON；禁止提内部协作过程；禁止编造未给出的数据。"
     )
     return "\n\n".join(parts)
@@ -453,8 +464,8 @@ def build_team_lead_messages(
     lead_scope = (
         f"{scope_note}\n"
         "你是给用户写最终答案的人：把各 Agent 评分卡当成内部素材消化掉，"
-        "不要提 Agent、评分卡、协作过程；按总分逻辑写成连贯口语——"
-        "先结论，后依据（技术、资金、框架与理论），再风险；不要套【小标题】。"
+        "不要提 Agent、评分卡、协作过程；紧扣用户本轮问题写成连贯口语——"
+        "问什么答什么，专业深度展开；开篇结论后按需要写依据与风险；不要套【小标题】。"
         f"（本轮 workflow={getattr(plan, 'workflow', '') or '—'}）"
     ).strip()
     system = build_chat_system_prompt(skill_names=(), scope_note=lead_scope)

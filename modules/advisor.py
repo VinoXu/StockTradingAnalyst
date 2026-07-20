@@ -42,14 +42,39 @@ _BIAS_SCORE = {
 
 
 def collect_analysis(symbol: str) -> dict[str, Any]:
-    """Gather all domain analyses for one symbol."""
-    s = load_snapshot(symbol)
-    if not s:
-        return {"available": False, "error": f"无本地数据：{symbol}"}
+    """Gather all domain analyses for one symbol.
 
-    history = load_indicator_history(symbol)
+    缺本地日K时自动 sync 一次再读；仍失败则返回 available=False，并带上接口层真实原因。
+    """
+    from modules.data_fetcher import _normalize_symbol, sync_symbol
+
+    sym = _normalize_symbol(symbol)
+    s = load_snapshot(sym)
+    sync_error: str | None = None
+    if not s:
+        try:
+            synced = sync_symbol(sym, start_date="20240101")
+            if (synced or {}).get("status") == "ok":
+                s = load_snapshot(sym)
+                if not s:
+                    sync_error = f"接口同步成功但本地仍无可用日K（{sym}）"
+            else:
+                sync_error = (synced or {}).get("error") or f"行情同步失败（{sym}）"
+        except Exception as exc:  # noqa: BLE001
+            sync_error = str(exc) or type(exc).__name__
+            s = None
+    if not s:
+        reason = sync_error or f"本地无日K且未能同步（{sym}）"
+        return {
+            "available": False,
+            "symbol": sym,
+            "error": f"已调行情接口仍无法分析 {sym}：{reason}",
+            "sync_error": sync_error,
+        }
+
+    history = load_indicator_history(sym)
     osc = analyze_oscillators(s, history)
-    trend = analyze_trend_structure(symbol)
+    trend = analyze_trend_structure(sym)
     as_of = symbol_data_as_of(s.symbol)
     quote_as_of = as_of["quote"]
     return {
@@ -64,10 +89,10 @@ def collect_analysis(symbol: str) -> dict[str, Any]:
         "oscillators": osc,
         "ma_boll": analyze_ma_boll(s),
         "volume_price": analyze_volume_price(s),
-        "candlestick": analyze_candlestick(symbol, prep_zone=osc.get("prep_zone")),
-        "price_patterns": analyze_price_patterns(symbol),
-        "capital_flow": analyze_capital_flow(symbol),
-        "relative_strength": analyze_relative_strength(symbol),
+        "candlestick": analyze_candlestick(sym, prep_zone=osc.get("prep_zone")),
+        "price_patterns": analyze_price_patterns(sym),
+        "capital_flow": analyze_capital_flow(sym),
+        "relative_strength": analyze_relative_strength(sym),
     }
 
 

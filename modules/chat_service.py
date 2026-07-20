@@ -29,7 +29,11 @@ from modules.chat_history import (
     set_active_session,
 )
 from modules.context_guard import PAYLOAD_BLOCKED_HINT, assess_payload, trim_fetched_aggressive
-from modules.conversation_memory import assess_context_limit, build_memory_block
+from modules.conversation_memory import (
+    assess_context_limit,
+    assess_memory_relevance,
+    build_memory_block,
+)
 from modules.cot_prompt import build_cot_instruction, strip_cot_leakage
 from modules.data_timestamps import collect_reference_meta, format_time_banner
 from modules.llm import build_chat_system_prompt, chat, chat_stream, llm_available
@@ -635,7 +639,11 @@ def _prepare_ask_llm(
 
     fetched = get_or_set(f"{cache_prefix}:fetched", _RESEARCH_PROCESS_TTL, _load_fetched)
 
-    memory_block, _memory_truncated = build_memory_block(prior, session_summary=session_summary)
+    memory_block, _memory_truncated = build_memory_block(
+        prior,
+        session_summary=session_summary,
+        current_message=message,
+    )
     agent_cards: list[dict] = []
     used_parallel = False
     if _should_run_parallel_agents(plan):
@@ -691,6 +699,7 @@ def _prepare_ask_llm(
 
     skill_names = select_skills_for_plan(plan, scope=_resolve_scope(effective)[0], team_lead=bool(agent_cards))
     agent_filter = fetched.get("agent_filter") or {}
+    mem_rel = assess_memory_relevance(message, prior) if prior else {"related": False, "reason": "no_prior"}
     log_ui_event(
         "context_preflight",
         detail={
@@ -710,6 +719,10 @@ def _prepare_ask_llm(
             "agent_card_chars": agent_filter.get("agent_card_chars"),
             "thin_sheet_chars": agent_filter.get("thin_sheet_chars"),
             "avg_score": agent_filter.get("avg_score"),
+            "memory_related": bool(mem_rel.get("related")),
+            "memory_reason": mem_rel.get("reason"),
+            "memory_indices": mem_rel.get("indices"),
+            "memory_injected": bool(memory_block),
         },
         session_id=sid,
     )

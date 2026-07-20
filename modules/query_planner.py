@@ -320,15 +320,26 @@ def plan_query(message: str, selected: list[str] | None = None) -> QueryPlan:
 
 
 def _compact_symbol(symbol: str) -> dict[str, Any]:
+    from modules.data_fetcher import resolve_stock_name
+
     sym = _normalize_symbol(symbol)
-    data = collect_analysis(sym)
+    data = collect_analysis(sym)  # 内部已在缺本地日K时自动 sync
     if not data.get("available"):
-        return {"symbol": sym, "available": False, "error": data.get("error")}
+        return {
+            "symbol": sym,
+            "name": resolve_stock_name(sym) or sym.split(".")[0],
+            "available": False,
+            "error": data.get("error") or "行情同步失败",
+        }
     holding = get_holding(sym)
     brief = summarize_symbol(data, holding=holding)
     times = data.get("data_as_of") or symbol_data_as_of(sym)
     quote = times.get("quote") or {}
-    display_name = ((holding or {}).get("name") or "").strip() or sym.split(".")[0]
+    display_name = (
+        ((holding or {}).get("name") or "").strip()
+        or resolve_stock_name(sym)
+        or sym.split(".")[0]
+    )
     candle = data.get("candlestick") or {}
     return {
         "symbol": sym,

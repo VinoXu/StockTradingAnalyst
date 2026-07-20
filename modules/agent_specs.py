@@ -178,12 +178,28 @@ def build_agent_evidence_symbol(fetched: dict[str, Any]) -> dict[str, Any]:
     research = fetched.get("research_reports") or {}
     fundamentals = fetched.get("fundamentals") or {}
     market = _compact_market_for_agents(fetched)
+    data_errors = [
+        {
+            "symbol": s.get("symbol"),
+            "name": s.get("name"),
+            "error": s.get("error"),
+        }
+        for s in symbols
+        if isinstance(s, dict) and not s.get("available", True)
+    ]
+    err_note = (
+        "若有 data_errors：必须把 error 原文告知用户，禁止改口猜「是否为A股」"
+        if data_errors
+        else ""
+    )
     return {
         "nison": {
             "agent": "nison",
             "skills": list(NISON_SKILL_NAMES),
             "focus": "蜡烛图形态与信号汇合；使用 symbols[].candle_bars 计量字段",
             "market": market,
+            "data_errors": data_errors,
+            "period_note": err_note,
             "symbols": [
                 {
                     "name": s.get("name") or s.get("symbol"),
@@ -199,6 +215,8 @@ def build_agent_evidence_symbol(fetched: dict[str, Any]) -> dict[str, Any]:
             "skills": list(MURPHY_SKILL_NAMES),
             "focus": "趋势结构、振荡指标、量价、价格形态；有 market 时必须先对大盘广度/指数表态",
             "market": market,
+            "data_errors": data_errors,
+            "period_note": err_note,
             "symbols": [
                 {
                     "name": s.get("name") or s.get("symbol"),
@@ -210,15 +228,32 @@ def build_agent_evidence_symbol(fetched: dict[str, Any]) -> dict[str, Any]:
                 if s.get("available")
             ],
         },
-        "duan": {**_master_evidence("duan", research, fundamentals, symbols), "market": market},
+        "duan": {
+            **_master_evidence("duan", research, fundamentals, symbols),
+            "market": market,
+            "data_errors": data_errors,
+            "period_note": err_note,
+        },
         "buffett": {
             **_master_evidence("buffett", research, fundamentals, symbols),
             "market": market,
+            "data_errors": data_errors,
+            "period_note": err_note,
             "skill_extra": "symbol-earnings-review",
             "focus": "财务质量、估值安全边际；对照 profits/ROE/毛利率与研报 EPS",
         },
-        "munger": {**_master_evidence("munger", research, fundamentals, symbols), "market": market},
-        "li": {**_master_evidence("li", research, fundamentals, symbols), "market": market},
+        "munger": {
+            **_master_evidence("munger", research, fundamentals, symbols),
+            "market": market,
+            "data_errors": data_errors,
+            "period_note": err_note,
+        },
+        "li": {
+            **_master_evidence("li", research, fundamentals, symbols),
+            "market": market,
+            "data_errors": data_errors,
+            "period_note": err_note,
+        },
     }
 
 

@@ -133,13 +133,27 @@ def fetch_daily_hist(
     adjust: str = "qfq",
 ) -> pd.DataFrame:
     """Fetch daily bars; East Money first, Tencent fallback when EM is blocked."""
+    em_err = "empty"
     try:
         df = _fetch_daily_hist_em(symbol, start_date, end_date, adjust)
         if df is not None and not df.empty:
             return df
-    except Exception:
-        pass
-    return _fetch_daily_hist_tx(symbol, start_date, end_date, adjust)
+    except Exception as exc:  # noqa: BLE001
+        em_err = str(exc) or type(exc).__name__
+    try:
+        df = _fetch_daily_hist_tx(symbol, start_date, end_date, adjust)
+        if df is not None and not df.empty:
+            return df
+        raise RuntimeError(
+            f"东财与腾讯均无日K（东财：{em_err}；腾讯：empty）"
+        )
+    except Exception as exc:  # noqa: BLE001
+        tx_err = str(exc) or type(exc).__name__
+        if "东财与腾讯" in tx_err:
+            raise
+        raise RuntimeError(
+            f"东财与腾讯行情均失败（东财：{em_err}；腾讯：{tx_err}）"
+        ) from exc
 
 
 def fetch_a_spot_em() -> pd.DataFrame:

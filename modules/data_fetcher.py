@@ -207,7 +207,13 @@ def sync_symbol(symbol: str, start_date: str = "20200101") -> dict[str, Any]:
         return {"symbol": _normalize_symbol(symbol), "quotes": 0, "indicators": 0, "status": "failed", "error": str(exc)}
     if quotes.empty:
         _log_fetch("sync_symbol", symbol, "failed", "empty quotes")
-        return {"symbol": symbol, "quotes": 0, "indicators": 0, "status": "failed"}
+        return {
+            "symbol": _normalize_symbol(symbol),
+            "quotes": 0,
+            "indicators": 0,
+            "status": "failed",
+            "error": "行情接口返回空K线（可能停牌过久、未上市、非可交易标的，或数据源暂无此代码）",
+        }
 
     enriched = enrich_indicators(quotes)
     q_count = save_quotes(quotes)

@@ -9,6 +9,8 @@ from modules.ta_analysis import load_indicator_history
 
 
 def build_charts(symbols: list[str], kinds: list[str] | None = None) -> list[dict[str, Any]]:
+    from modules.data_fetcher import sync_symbol
+
     kinds = kinds or ["price"]
     charts: list[dict[str, Any]] = []
     for raw in symbols[:3]:
@@ -16,10 +18,22 @@ def build_charts(symbols: list[str], kinds: list[str] | None = None) -> list[dic
         code = sym.split(".")[0]
         if "price" in kinds:
             c = _price_chart(sym, code)
+            if not c:
+                try:
+                    sync_symbol(sym, start_date="20240101")
+                except Exception:  # noqa: BLE001
+                    pass
+                c = _price_chart(sym, code)
             if c:
                 charts.append(c)
         if "rsi" in kinds:
             c = _rsi_chart(sym, code)
+            if not c:
+                try:
+                    sync_symbol(sym, start_date="20240101")
+                except Exception:  # noqa: BLE001
+                    pass
+                c = _rsi_chart(sym, code)
             if c:
                 charts.append(c)
     return charts

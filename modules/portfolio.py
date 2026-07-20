@@ -95,10 +95,19 @@ def ensure_holding_name(symbol: str) -> str | None:
 
 def position_summary(holding: dict[str, Any]) -> dict[str, Any]:
     """Attach latest price and PnL to one holding row."""
+    from modules.data_fetcher import sync_symbol
+
     resolved_name = ensure_holding_name(holding["symbol"])
     if resolved_name:
         holding = {**holding, "name": resolved_name}
     snap = load_snapshot(holding["symbol"])
+    if not snap:
+        try:
+            synced = sync_symbol(holding["symbol"], start_date="20240101")
+            if (synced or {}).get("status") == "ok":
+                snap = load_snapshot(holding["symbol"])
+        except Exception:  # noqa: BLE001
+            snap = None
     qty = float(holding.get("quantity") or 0)
     cost = holding.get("cost_price")
     close = snap.close if snap else None
