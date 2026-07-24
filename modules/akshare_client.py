@@ -740,9 +740,148 @@ def classify_network_error(error: Exception | None) -> str:
         return "ssl_proxy"
     if "timeout" in msg or "timed out" in msg:
         return "timeout"
+    # Windows OSError errno 22 often surfaces as socket/SSL transport failure
+    if "errno 22" in msg or "invalid argument" in msg:
+        return "transport"
     if "remote" in msg or "connection" in msg or "abruptly" in msg:
         return "ip_or_firewall"
     return "unknown"
+
+
+def humanize_fetch_error(error: Exception | str | None) -> str:
+    """Map low-level transport errors to short Chinese notes for LLM / UI."""
+    if error is None:
+        return "未知错误"
+    raw = str(error).strip() if not isinstance(error, Exception) else (str(error).strip() or type(error).__name__)
+    if not raw:
+        return "未知错误"
+    scenario = classify_network_error(error if isinstance(error, Exception) else Exception(raw))
+    labels = {
+        "ssl_proxy": "网络/证书异常（可能被代理或防火墙干扰）",
+        "timeout": "接口超时",
+        "transport": "网络传输层失败（非业务参数错误；常见于东财链路瞬时中断）",
+        "ip_or_firewall": "连接被重置或阻断（IP/防火墙）",
+    }
+    label = labels.get(scenario)
+    if label:
+        return label
+    # Strip noisy errno wrappers so the model does not say「参数非法」
+    low = raw.lower()
+    if "errno 22" in low or "invalid argument" in low:
+        return labels["transport"]
+    if len(raw) > 160:
+        return raw[:157] + "..."
+    return raw
+
+
+def fetch_em_sector_fund_flow_rank(
+    *,
+    sector_type: str = "行业资金流",
+    top_n: int = 15,
+) -> pd.DataFrame:
+    """
+    East Money board fund-flow rank via curl_cffi + multi-host.
+    Uses fid=f62 (主力净流入) sort — akshare's fid0 often does not sort on current API.
+    """
+    import math
+
+    sector_type_map = {"行业资金流": "2", "概念资金流": "3", "地域资金流": "1"}
+    if sector_type not in sector_type_map:
+        raise ValueError(f"unsupported sector_type: {sector_type}")
+
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError as exc:
+        raise RuntimeError("curl_cffi required for East Money sector fund flow") from exc
+
+    configure_akshare_environment()
+    headers = {
+        "Referer": "https://data.eastmoney.com/bkzj/hy.html",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+    # 今日主力净流入字段集（与 ak.stock_sector_fund_flow_rank「今日」一致）
+    fields = "f12,f14,f2,f3,f62,f184,f66,f69,f72,f75,f78,f81,f84,f87,f204,f205,f124"
+    need = max(int(top_n) * 2, 30)
+    pz = min(100, max(need, 50))
+    base_params = {
+        "pz": str(pz),
+        "po": "1",
+        "np": "1",
+        "ut": "b2884a393a59ad64002292a3e90d46a5",
+        "fltt": "2",
+        "invt": "2",
+        "fid": "f62",
+        "fid0": "f62",
+        "fs": f"m:90 t:{sector_type_map[sector_type]}",
+        "stat": "1",
+        "fields": fields,
+        "rt": "52975239",
+    }
+
+    last_error: Exception | None = None
+    for host in _EM_CLIST_HOSTS:
+        rows: list[dict[str, Any]] = []
+        try:
+            pn = 1
+            total = None
+            while True:
+                params = {**base_params, "pn": str(pn), "_": str(int(time.time() * 1000))}
+                resp = curl_requests.get(
+                    f"{host}/api/qt/clist/get",
+                    params=params,
+                    headers=headers,
+                    impersonate="chrome",
+                    timeout=READ_TIMEOUT,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                block = payload.get("data") or {}
+                batch = block.get("diff") or []
+                if total is None:
+                    total = int(block.get("total") or 0)
+                if not batch:
+                    break
+                rows.extend(batch)
+                if len(rows) >= need:
+                    break
+                if total and len(rows) >= total:
+                    break
+                per_page = len(batch)
+                if per_page <= 0:
+                    break
+                max_page = math.ceil(total / per_page) if total else pn
+                if pn >= max_page:
+                    break
+                pn += 1
+                time.sleep(random.uniform(0.15, 0.35))
+            if not rows:
+                last_error = RuntimeError("empty sector fund flow")
+                continue
+            df = pd.DataFrame(rows)
+            out = pd.DataFrame(
+                {
+                    "名称": df.get("f14"),
+                    "今日涨跌幅": df.get("f3"),
+                    "今日主力净流入-净额": df.get("f62"),
+                    "今日主力净流入-净占比": df.get("f184"),
+                    "今日超大单净流入-净额": df.get("f66"),
+                    "今日大单净流入-净额": df.get("f72"),
+                    "今日中单净流入-净额": df.get("f78"),
+                    "今日小单净流入-净额": df.get("f84"),
+                }
+            )
+            out = out.dropna(subset=["名称"])
+            if out.empty:
+                last_error = RuntimeError("sector fund flow missing names")
+                continue
+            return out
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            continue
+    raise last_error or RuntimeError("East Money sector fund flow unreachable")
 
 
 def diagnose() -> dict[str, Any]:

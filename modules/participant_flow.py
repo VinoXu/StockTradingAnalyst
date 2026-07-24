@@ -7,11 +7,15 @@ from typing import Any
 
 import akshare as ak
 
-from modules.akshare_client import fetch_with_retry
+from modules.akshare_client import (
+    fetch_em_sector_fund_flow_rank,
+    fetch_with_retry,
+    humanize_fetch_error,
+)
 from modules.capital_flow import consecutive_net_inflow_days, fetch_stock_fund_flow, save_capital_flow
 from modules.data_fetcher import _normalize_symbol, _symbol_to_ak_code
 from modules.db import get_connection, init_db
-from modules.runtime_cache import get_or_set
+from modules.runtime_cache import get_or_set, invalidate
 
 _NORTH_CACHE_TTL = 120.0
 _SECTOR_FLOW_TTL = 180.0
@@ -35,9 +39,12 @@ def _now() -> str:
 def fetch_northbound_summary() -> dict[str, Any]:
     """Market-wide northbound net buy today (沪股通+深股通)."""
     def _load() -> dict[str, Any]:
-        raw = fetch_with_retry(ak.stock_hsgt_fund_flow_summary_em)
+        try:
+            raw = fetch_with_retry(ak.stock_hsgt_fund_flow_summary_em, max_retry=2, base_delay=1.0)
+        except Exception as exc:  # noqa: BLE001
+            return {"available": False, "error": humanize_fetch_error(exc)}
         if raw is None or raw.empty:
-            return {"available": False, "error": "empty northbound summary"}
+            return {"available": False, "error": "北向摘要返回空"}
         rows: list[dict[str, Any]] = []
         total_net = 0.0
         has_net = False
@@ -85,7 +92,10 @@ def fetch_northbound_summary() -> dict[str, Any]:
             "note": "北向=沪深港通资金；日频/盘中更新，非逐笔席位。",
         }
 
-    return get_or_set("data:northbound_summary", _NORTH_CACHE_TTL, _load)
+    hit = get_or_set("data:northbound_summary", _NORTH_CACHE_TTL, _load)
+    if not hit.get("available"):
+        invalidate("data:northbound_summary")
+    return hit
 
 
 def fetch_lhb_participant_breakdown(symbol: str, *, lookback_days: int = 5) -> dict[str, Any]:
@@ -126,49 +136,158 @@ def fetch_lhb_participant_breakdown(symbol: str, *, lookback_days: int = 5) -> d
     return get_or_set(f"data:lhb_inst:{code}", _LHB_CACHE_TTL, _load)
 
 
+def _parse_sector_flow_df(raw: Any, *, sector_type: str, top_n: int, source: str, note: str) -> dict[str, Any]:
+    if raw is None or getattr(raw, "empty", True):
+        return {"available": False, "sector_type": sector_type, "error": "板块资金流返回空"}
+    name_col = next(
+        (c for c in raw.columns if "名称" in str(c) or str(c) == "行业"),
+        raw.columns[1] if len(raw.columns) > 1 else raw.columns[0],
+    )
+    # Prefer explicit 主力净流入; avoid matching 超大单/大单 first
+    net_col = next(
+        (c for c in raw.columns if "主力" in str(c) and "净" in str(c) and "流入" in str(c) and "额" in str(c)),
+        None,
+    )
+    if net_col is None:
+        net_col = next((c for c in raw.columns if str(c) in ("净额", "今日主力净流入-净额")), None)
+    if net_col is None:
+        net_col = next((c for c in raw.columns if "净" in str(c) and "流入" in str(c)), raw.columns[-1])
+    items: list[dict[str, Any]] = []
+    for _, row in raw.iterrows():
+        name = str(row.get(name_col) or "").strip()
+        if not name:
+            continue
+        try:
+            net = float(row.get(net_col) or 0)
+        except (TypeError, ValueError):
+            net = 0.0
+        items.append({"name": name, "main_net_inflow": net})
+    if not items:
+        return {"available": False, "sector_type": sector_type, "error": "板块资金流无有效行"}
+    items.sort(key=lambda x: x["main_net_inflow"], reverse=True)
+    return {
+        "available": True,
+        "sector_type": sector_type,
+        "source": source,
+        "top_inflow": items[:top_n],
+        "top_outflow": sorted(items, key=lambda x: x["main_net_inflow"])[:top_n],
+        "note": note,
+    }
+
+
 def fetch_sector_fund_flow_rank(*, sector_type: str = "行业资金流", top_n: int = 15) -> dict[str, Any]:
-    """East Money sector fund flow rank (industry or concept)."""
+    """Sector fund flow rank: curl_cffi EM → akshare EM → THS industry fallback."""
+
+    def _from_em_curl() -> dict[str, Any]:
+        try:
+            raw = fetch_em_sector_fund_flow_rank(sector_type=sector_type, top_n=top_n)
+        except Exception as exc:  # noqa: BLE001
+            return {"available": False, "sector_type": sector_type, "error": humanize_fetch_error(exc)}
+        return _parse_sector_flow_df(
+            raw,
+            sector_type=sector_type,
+            top_n=top_n,
+            source="eastmoney_clist_curl",
+            note="东财板块主力净流入估算（curl 多 host），非交易所逐笔。",
+        )
+
+    def _from_em_akshare() -> dict[str, Any]:
+        try:
+            raw = fetch_with_retry(
+                ak.stock_sector_fund_flow_rank,
+                indicator="今日",
+                sector_type=sector_type,
+                max_retry=2,
+                base_delay=1.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"available": False, "sector_type": sector_type, "error": humanize_fetch_error(exc)}
+        return _parse_sector_flow_df(
+            raw,
+            sector_type=sector_type,
+            top_n=top_n,
+            source="eastmoney_clist",
+            note="东财板块主力净流入估算，非交易所逐笔。",
+        )
+
+    def _from_industry_fallback() -> dict[str, Any]:
+        """同花顺即时行业资金流；净额单位为亿元，换算为元与东财口径对齐。"""
+        try:
+            raw = fetch_with_retry(ak.stock_fund_flow_industry, symbol="即时", max_retry=2, base_delay=0.8)
+        except Exception as exc:  # noqa: BLE001
+            return {"available": False, "sector_type": sector_type, "error": humanize_fetch_error(exc)}
+        if raw is None or raw.empty:
+            return {"available": False, "sector_type": sector_type, "error": "同花顺行业资金流返回空"}
+        # 单位换算：亿元 → 元
+        name_col = "行业" if "行业" in raw.columns else raw.columns[1]
+        net_col = "净额" if "净额" in raw.columns else None
+        if net_col is None:
+            return {"available": False, "sector_type": sector_type, "error": "同花顺缺净额字段"}
+        scaled = raw.copy()
+        try:
+            scaled[net_col] = scaled[net_col].astype(float) * 1e8
+        except (TypeError, ValueError):
+            return {"available": False, "sector_type": sector_type, "error": "同花顺净额无法解析"}
+        # 借用名称列别名，供统一解析
+        if "名称" not in scaled.columns:
+            scaled["名称"] = scaled[name_col]
+        scaled["今日主力净流入-净额"] = scaled[net_col]
+        return _parse_sector_flow_df(
+            scaled,
+            sector_type=sector_type,
+            top_n=top_n,
+            source="ths_industry_instant",
+            note=(
+                "同花顺即时行业资金净额（已×1亿换算为元）；"
+                "为东财板块资金流断开时的备用源，非公募/游资席位比例。"
+            ),
+        )
 
     def _load() -> dict[str, Any]:
-        try:
-            raw = fetch_with_retry(ak.stock_sector_fund_flow_rank, indicator="今日", sector_type=sector_type)
-        except Exception as exc:  # noqa: BLE001
-            return {"available": False, "sector_type": sector_type, "error": str(exc)}
-        if raw is None or raw.empty:
-            return {"available": False, "sector_type": sector_type, "error": "empty"}
-        name_col = next((c for c in raw.columns if "名称" in str(c)), raw.columns[1] if len(raw.columns) > 1 else raw.columns[0])
-        net_col = next((c for c in raw.columns if "净" in str(c) and "流入" in str(c)), None)
-        if net_col is None:
-            net_col = next((c for c in raw.columns if "净流入" in str(c)), raw.columns[-1])
-        items: list[dict[str, Any]] = []
-        for _, row in raw.head(top_n * 2).iterrows():
-            name = str(row.get(name_col) or "").strip()
-            if not name:
-                continue
-            try:
-                net = float(row.get(net_col) or 0)
-            except (TypeError, ValueError):
-                net = 0.0
-            items.append({"name": name, "main_net_inflow": net})
-        items.sort(key=lambda x: x["main_net_inflow"], reverse=True)
+        errors: list[str] = []
+        primary = _from_em_curl()
+        if primary.get("available"):
+            return primary
+        errors.append(f"东财curl({primary.get('error') or '失败'})")
+
+        secondary = _from_em_akshare()
+        if secondary.get("available"):
+            secondary["fallback_of"] = primary.get("error") or "eastmoney_curl_failed"
+            return secondary
+        errors.append(f"东财ak({secondary.get('error') or '失败'})")
+
+        if sector_type == "行业资金流":
+            fb = _from_industry_fallback()
+            if fb.get("available"):
+                fb["fallback_of"] = "；".join(errors)
+                return fb
+            errors.append(f"同花顺({fb.get('error') or '失败'})")
+
         return {
-            "available": True,
+            "available": False,
             "sector_type": sector_type,
-            "top_inflow": items[:top_n],
-            "top_outflow": sorted(items, key=lambda x: x["main_net_inflow"])[:top_n],
-            "note": "东财板块主力净流入估算，非交易所逐笔。",
+            "error": "；".join(errors) if errors else "板块资金流未返回",
         }
 
     key = f"data:sector_flow:{sector_type}"
-    return get_or_set(key, _SECTOR_FLOW_TTL, _load)
+    # 失败不长缓存，避免整轮问答被一次断连锁死
+    hit = get_or_set(key, _SECTOR_FLOW_TTL, _load)
+    if not hit.get("available"):
+        invalidate(key)
+    return hit
 
 
 def match_sector_fund_flows(sector_names: list[str]) -> list[dict[str, Any]]:
     """Match user/sector keywords to industry+concept fund flow rows."""
     if not sector_names:
         return []
-    industry = fetch_sector_fund_flow_rank(sector_type="行业资金流")
-    concept = fetch_sector_fund_flow_rank(sector_type="概念资金流")
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_ind = pool.submit(fetch_sector_fund_flow_rank, sector_type="行业资金流")
+        fut_con = pool.submit(fetch_sector_fund_flow_rank, sector_type="概念资金流")
+        industry = fut_ind.result()
+        concept = fut_con.result()
     hits: list[dict[str, Any]] = []
     seen: set[str] = set()
     for block in (industry, concept):
@@ -321,16 +440,38 @@ def ensure_symbol_capital_flow(symbol: str) -> dict[str, Any]:
 
 def collect_market_participant_context(*, sector_keywords: list[str] | None = None) -> dict[str, Any]:
     """Northbound + optional sector fund flow for market/sector questions."""
-    out: dict[str, Any] = {
-        "northbound": fetch_northbound_summary(),
-        "note": "参与者行为为估算/上榜日明细，须结合 Skill 做意图推断，禁止当逐笔事实。",
-    }
+    from concurrent.futures import ThreadPoolExecutor
+
     kws = [k for k in (sector_keywords or []) if k and len(k) >= 2]
-    if kws:
-        matched = match_sector_fund_flows(kws)
-        if matched:
-            out["sector_fund_flow_matched"] = matched
-    industry = fetch_sector_fund_flow_rank(sector_type="行业资金流")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_nb = pool.submit(fetch_northbound_summary)
+        fut_ind = pool.submit(fetch_sector_fund_flow_rank, sector_type="行业资金流")
+        nb = fut_nb.result()
+        industry = fut_ind.result()
+
+    # 行业已在缓存；有关键词时再补概念匹配（避免与行业请求并行双打）
+    matched = match_sector_fund_flows(kws) if kws else []
+
+    out: dict[str, Any] = {
+        "northbound": nb,
+        "note": (
+            "参与者行为为估算/上榜日明细，须结合 Skill 做意图推断，禁止当逐笔事实。"
+            "大盘级资金细分仅有行业主力净流入排行；公募/游资席位比例仅龙虎榜上榜个股才有，本链路不提供。"
+        ),
+    }
+    if matched:
+        out["sector_fund_flow_matched"] = matched
     if industry.get("available"):
         out["sector_fund_flow_industry_top"] = (industry.get("top_inflow") or [])[:8]
+        out["sector_fund_flow_meta"] = {
+            "available": True,
+            "source": industry.get("source"),
+            "note": industry.get("note"),
+        }
+    else:
+        out["sector_fund_flow_meta"] = {
+            "available": False,
+            "error": humanize_fetch_error(industry.get("error")),
+            "note": "行业主力净流入排行本轮未返回；禁止改口成公募/游资比例不明。",
+        }
     return out

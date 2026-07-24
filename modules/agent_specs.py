@@ -52,6 +52,12 @@ TA_SCREEN_AGENT_ROSTER: tuple[tuple[str, str], ...] = (
     ("quality", "ta-quality-screen"),
 )
 
+SITUATION_ADVICE_AGENT_ROSTER: tuple[tuple[str, str], ...] = (
+    ("murphy", "ta-trend-structure"),
+    ("munger", "master-munger"),
+    ("checklist", "ta-investment-checklist"),
+)
+
 MASTER_AGENT_IDS = frozenset({"duan", "buffett", "munger", "li"})
 
 
@@ -74,6 +80,8 @@ def agent_roster_for_plan(plan: QueryPlan) -> tuple[tuple[str, str], ...]:
         return PORTFOLIO_AGENT_ROSTER
     if wf == "ta_screen":
         return TA_SCREEN_AGENT_ROSTER
+    if wf == "situation_advice":
+        return SITUATION_ADVICE_AGENT_ROSTER
     if plan.research_mode == "sector_research":
         return SECTOR_AGENT_ROSTER
     if plan.research_mode == "symbol_research":
@@ -94,6 +102,8 @@ def team_lead_skills_for_plan(plan: QueryPlan) -> tuple[str, ...]:
         return ("portfolio-review", "ta-trend-structure", "thesis-drift")
     if wf == "ta_screen":
         return ("ta-investment-checklist", "ta-quality-screen", "ta-trend-structure")
+    if wf == "situation_advice":
+        return ("ta-trend-structure", "ta-investment-checklist", "ta-volume-price")
     if plan.research_mode == "symbol_research":
         return (
             "symbol-deep-research",
@@ -118,7 +128,7 @@ def uses_parallel_agents(plan: QueryPlan) -> bool:
 
 def should_persist_thesis(plan: QueryPlan) -> bool:
     """Only full symbol deep-research writes investment thesis."""
-    if plan.workflow in ("news_pulse", "dyp_ask", "portfolio_review", "ta_screen"):
+    if plan.workflow in ("news_pulse", "dyp_ask", "portfolio_review", "ta_screen", "situation_advice"):
         return False
     return plan.research_mode == "symbol_research" and bool(plan.symbols)
 
@@ -162,6 +172,11 @@ def _compact_market_for_agents(fetched: dict[str, Any]) -> dict[str, Any] | None
             "amount": live.get("amount"),
             "as_of_label": live.get("as_of_label"),
         }
+    else:
+        pack["index_live_sh"] = {
+            "available": False,
+            "error": (live or {}).get("error") or "上证盘中价本轮未返回",
+        }
     if live_sz.get("available") and live_sz.get("price") is not None:
         pack["index_live_sz"] = {
             "name": live_sz.get("name") or "深证成指",
@@ -170,6 +185,23 @@ def _compact_market_for_agents(fetched: dict[str, Any]) -> dict[str, Any] | None
             "amount": live_sz.get("amount"),
             "as_of_label": live_sz.get("as_of_label"),
         }
+    else:
+        pack["index_live_sz"] = {
+            "available": False,
+            "error": (live_sz or {}).get("error") or "深证盘中价本轮未返回",
+        }
+    turnover = market.get("two_market_turnover") or {}
+    pack["two_market_turnover"] = {
+        "available": bool(turnover.get("available")),
+        "amount_yi": turnover.get("amount_yi"),
+        "amount_yi_text": turnover.get("amount_yi_text"),
+        "partial": turnover.get("partial"),
+        "error": turnover.get("error"),
+        "note": turnover.get("note"),
+    }
+    essentials = market.get("essentials")
+    if isinstance(essentials, dict):
+        pack["essentials"] = essentials
     return pack
 
 

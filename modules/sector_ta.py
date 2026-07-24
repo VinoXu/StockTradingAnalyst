@@ -410,6 +410,19 @@ def rank_boards_by_ta(
 ) -> list[dict[str, Any]]:
     if not boards:
         return []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     candidates = _select_boards_for_ta_scan(boards, limit=ta_scan_limit)
-    scanned = [score_board_row(row) for row in candidates]
+    if not candidates:
+        return []
+    scanned: list[dict[str, Any]] = []
+    workers = min(6, len(candidates))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(score_board_row, row): row for row in candidates}
+        for fut in as_completed(futs):
+            try:
+                scanned.append(fut.result())
+            except Exception:  # noqa: BLE001
+                row = futs[fut]
+                scanned.append({**row, "score": 0.0, "pick_reason": "形态分析失败"})
     return sorted(scanned, key=lambda x: float(x.get("score") or 0), reverse=True)[:top_n]

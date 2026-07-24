@@ -227,15 +227,25 @@ def build_thin_fact_sheet(fetched: dict[str, Any]) -> str:
                 f"（{breadth.get('trade_date') or '—'}）"
             )
         else:
-            bits.append("涨跌家数：本轮未核实")
+            bits.append(f"涨跌家数：本轮未核实（{breadth.get('error') or '无数据'}）")
         for key, label in (("index_live", "上证"), ("index_live_sz", "深证")):
             live = market.get(key) or {}
             if live.get("available") and live.get("price") is not None:
                 chg = live.get("change_pct")
                 chg_txt = f"{chg:+.2f}%" if isinstance(chg, (int, float)) else str(chg or "—")
-                bits.append(f"{label}{live.get('price')}（{chg_txt}，{live.get('as_of_label') or '盘中'}）")
+                amt = live.get("amount")
+                amt_txt = f"，成交额{amt / 1e8:.0f}亿" if isinstance(amt, (int, float)) else ""
+                bits.append(
+                    f"{label}{live.get('price')}（{chg_txt}{amt_txt}，{live.get('as_of_label') or '盘中'}）"
+                )
             else:
-                bits.append(f"{label}盘中价：本轮未核实")
+                bits.append(f"{label}盘中价：本轮未核实（{live.get('error') or '无数据'}）")
+        turnover = market.get("two_market_turnover") or {}
+        if turnover.get("available") and turnover.get("amount_yi_text"):
+            partial = "（部分）" if turnover.get("partial") else ""
+            bits.append(f"两市成交额{partial}{turnover.get('amount_yi_text')}")
+        else:
+            bits.append(f"两市成交额：本轮未核实（{turnover.get('error') or '无数据'}）")
         dow = market.get("dow") or {}
         if dow.get("available"):
             bits.append(f"双指数结构：{dow.get('state_cn') or dow.get('state')}")
@@ -243,8 +253,37 @@ def build_thin_fact_sheet(fetched: dict[str, Any]) -> str:
                 if note:
                     bits.append(str(note)[:60])
         else:
-            bits.append(f"双指数历史日K：{dow.get('state_cn') or '缺失'}")
+            bits.append(
+                f"双指数历史日K：本轮未核实（{dow.get('error') or dow.get('state_cn') or '缺失'}）"
+            )
         lines.append("- 大盘: " + "；".join(bits))
+
+    pf = fetched.get("participant_flow") or {}
+    if isinstance(pf, dict) and pf:
+        pf_bits: list[str] = []
+        nb = pf.get("northbound") or {}
+        if nb.get("available"):
+            net = nb.get("total_net_buy")
+            if isinstance(net, (int, float)):
+                pf_bits.append(f"北向合计净买 {net:,.0f}（{nb.get('trade_date') or '—'}）")
+            else:
+                pf_bits.append(f"北向：接口已返回但净买为空（{nb.get('trade_date') or '—'}）")
+            if nb.get("status_note"):
+                pf_bits.append(str(nb.get("status_note"))[:80])
+        else:
+            pf_bits.append(f"北向：本轮未核实（{nb.get('error') or '无数据'}）")
+        fs = pf.get("fund_structure") or {}
+        if fs.get("available"):
+            tops = (fs.get("top_inflow") or [])[:3]
+            names = [str(r.get("name") or "") for r in tops if isinstance(r, dict) and r.get("name")]
+            if names:
+                pf_bits.append("行业主力净流入靠前: " + "、".join(names))
+            else:
+                pf_bits.append("资金细分（板块主力净流入）：已返回")
+        elif fs:
+            pf_bits.append(f"资金细分：本轮未核实（{fs.get('error') or '无数据'}）")
+        if pf_bits:
+            lines.append("- 资金: " + "；".join(pf_bits))
 
     # 优先：语义驱动的区间累计收益榜；否则退回「最新交易日」跌幅
     sector_bits: list[str] = []
@@ -437,12 +476,17 @@ def build_team_lead_user_blob(
         f"【用户问题】\n{message}\n\n"
         "你是最终执笔人：用户看不到 Agent 过程。把评分看板与评分卡消化成连贯口语答复——"
         "紧扣本轮问题：问什么答什么，给专业深度而非空泛概述；"
-        "开篇直接给本问题结论，再按需要展开证据与机制；技术/资金等用得上再写，勿为凑结构灌水；"
-        "不要输出任何【……】框架小标题，不要像填表。立场用偏多观察/观望/降权。"
-        "极瘦摘要里若已有涨跌家数、指数结构、财务数字，必须当作已核实依据写进结论，"
-        "禁止再说「关键大盘/财务数据没抓全」之类空话；只有摘要明确写「本轮未核实」的项才可声明缺数。"
+        "涉及方向时开篇先出【观点结论】：短期写「更可能延续上涨/回吐/震荡」直白句，中期写偏多/偏空/观望；再分短线/中期展开建议；"
+        "其它内容不要套【小标题】、不要像填表。禁止必涨必跌与下单价。"
+        "极瘦摘要里若已有涨跌家数、指数结构、两市成交额、北向、财务数字，必须当作已核实依据写进结论，"
+        "禁止再说「关键大盘/财务数据没抓全」「成交额/北向本轮接口未返回」之类空话；"
+        "只有摘要明确写「本轮未核实」的项才可声明缺数；北向净买为 0 须如实写 0，不算失败。"
+        "禁止编造「字段变动」「穿透三级接口」等未在摘要/error 中出现的原因。"
         "若摘要写明某标的「数据不可用」及原因，开篇必须如实告知该原因，"
         "禁止改口成「建议确认是否为A股」等猜测。"
+        "若用户问被套/回本/解套/整盘亏损等开放处境：禁止「无法分析」拒答，也禁止把问题扭成单票ETF/杠杆鉴定；"
+        "必须先给账户层面的回本算术与可检验技术路径，并结合本轮大盘/板块事实；持仓列表仅作收尾细化。"
+        "若本轮激活多路由（大盘+讨论+个股等），开篇先答用户主问题，再把其他路由证据织进同一篇，禁止只答一路。"
         "禁止 Markdown；禁止复述 Agent JSON；禁止提内部协作过程；禁止编造未给出的数据。"
     )
     return "\n\n".join(parts)
@@ -465,7 +509,8 @@ def build_team_lead_messages(
         f"{scope_note}\n"
         "你是给用户写最终答案的人：把各 Agent 评分卡当成内部素材消化掉，"
         "不要提 Agent、评分卡、协作过程；紧扣用户本轮问题写成连贯口语——"
-        "问什么答什么，专业深度展开；开篇结论后按需要写依据与风险；不要套【小标题】。"
+        "问什么答什么，专业深度展开；方向题先【观点结论】分短线/中期，再写依据与风险；"
+        "除【观点结论】外不要套其它【小标题】。"
         f"（本轮 workflow={getattr(plan, 'workflow', '') or '—'}）"
     ).strip()
     system = build_chat_system_prompt(skill_names=(), scope_note=lead_scope)

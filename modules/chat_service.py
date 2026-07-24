@@ -41,6 +41,7 @@ from modules.outlook_format import (
     OUTLOOK_INSTRUCTION,
     OUTLOOK_SECTION_TITLE,
     build_guidance_instruction,
+    needs_dual_horizon,
     parse_outlook,
 )
 from modules.query_planner import (
@@ -199,8 +200,15 @@ def activate_session(session_id: int) -> dict:
 
 
 _WORKFLOW_HINTS: dict[str, str] = {
+    "direct_chat": (
+        "【工作流·直接对话】本轮未触发投资取数路由。"
+        "按普通助手对话回答：简洁自然；禁止输出【观点结论】、短中期卡片、行情复盘或投研框架；"
+        "若用户其实想问股票/大盘/板块，可简短追问具体问题。"
+    ),
     "market_overview": (
-        "【工作流·大盘环境】从 Skill（趋势/广度/量价）推断：接下来大盘更可能延续还是转折；"
+        "【工作流·大盘环境】从 Skill（趋势/广度/量价）推断："
+        "短线必须直白写「更可能延续上涨 / 更可能回吐 / 更可能震荡整理」；"
+        "中期结构是延续下跌/上涨还是转折；二者可相反但必须分开写。"
         "点 1～2 个受益或受损的主线方向，不要只报指数涨跌。"
     ),
     "sector_deep_dive": (
@@ -228,6 +236,14 @@ _WORKFLOW_HINTS: dict[str, str] = {
     "question_deep_dive": (
         "【工作流·问题驱动】先答用户真正要什么（机会还是风险），"
         "再从 market/sectors 中匹配数据，用 Skill 做 forward 推断，禁止行情复述充字数。"
+    ),
+    "situation_advice": (
+        "【工作流·处境决策】用户在讲整体亏损/被套/回本或整盘表现，默认按账户/组合层面回答，"
+        "不要追问成单只ETF或杠杆鉴定题（除非用户自己强调单票）。"
+        "必须覆盖：回本所需净值涨幅（亏30%约需再涨约43%）、仓位同向暴露与弱腿拖累、"
+        "可检验动作（降相关、留强汰弱、条件换强、禁止下跌趋势里加倍摊薄）；"
+        "结合本轮大盘广度/成交额/行业资金约束环境；"
+        "禁止开篇「未提供代码无法分析」；持仓明细只能作收尾细化邀请；禁止保证赚回、禁止下单价位。"
     ),
     "symbol_research": (
         "【工作流·个股深研】六 Agent：Nison 蜡烛图 + Murphy 趋势量价 + 四大师（研报/估值）。"
@@ -283,11 +299,26 @@ def _compose_user_message(
     memory_block: str,
     fetched: dict,
 ) -> str:
+    # 无投资路由：轻量对话，不注入投研 mandate / COT / 取数块
+    if (fetched.get("workflow") or "") == "direct_chat":
+        parts: list[str] = [
+            _WORKFLOW_HINTS["direct_chat"],
+        ]
+        if memory_block:
+            parts.append(memory_block)
+        parts.append(f"【用户】\n{message}")
+        return "\n\n".join(parts)
+
     parts: list[str] = [
         CORE_ANALYSIS_MANDATE,
         USER_REPLY_STRUCTURE,
         build_cot_instruction(fetched),
     ]
+    from modules.route_planner import compose_hint
+
+    route_hint = compose_hint(list(fetched.get("routes") or []))
+    if route_hint:
+        parts.append(route_hint)
     if memory_block:
         parts.append(memory_block)
 
@@ -310,7 +341,6 @@ def _compose_user_message(
                 "以这些标的为主作答，不要写成全市/全行业复盘。"
                 "仅当用户明确问大盘或板块时，才用一两句概括环境。"
             )
-            outlook_hint = OUTLOOK_INSTRUCTION
     elif fetched.get("question_driven"):
         workflow = fetched.get("workflow") or "question_deep_dive"
         workflow_hint = _WORKFLOW_HINTS.get(workflow, _WORKFLOW_HINTS["question_deep_dive"])
@@ -321,8 +351,6 @@ def _compose_user_message(
             sector_hint = (
                 "引用 sectors 里的涨跌幅与领涨股；板块数据来自东财/同花顺，与 LLM 配置无关。"
             )
-    elif fetched.get("symbols") and not fetched.get("sector_only"):
-        outlook_hint = OUTLOOK_INSTRUCTION
     elif fetched.get("sector_only") or "sector" in (fetched.get("query_intents") or []):
         sector_hint = (
             "本轮为板块/行业级问题：请按行业板块与概念板块回答（如石油、半导体、银行、新能源等），"
@@ -330,6 +358,9 @@ def _compose_user_message(
             "若 sectors.available 为 true 则必须使用其中数据；"
             "板块数据来自东财/同花顺行情接口，与阿里云 LLM 配置无关，勿将行情失败归因于 API Key。"
         )
+
+    if needs_dual_horizon(fetched):
+        outlook_hint = OUTLOOK_INSTRUCTION
 
     if portfolio_hint:
         parts.append(portfolio_hint)
@@ -378,14 +409,51 @@ def _compose_user_message(
     if qa.get("issues"):
         parts.append("【数据质检】" + "；".join(qa["issues"]))
     pf = fetched.get("participant_flow") or {}
-    if pf.get("northbound", {}).get("available"):
-        nb = pf["northbound"]
-        net = nb.get("total_net_buy")
-        net_s = f"{net:,.0f}" if net is not None else "—"
-        parts.append(
-            f"【北向资金·全市场】{nb.get('trade_date', '')} 北向合计净买 {net_s}。"
-            "须结合内资大小单结构判断内外资是否分歧。"
-        )
+    nb = pf.get("northbound") if isinstance(pf, dict) else None
+    if isinstance(nb, dict):
+        if nb.get("available"):
+            net = nb.get("total_net_buy")
+            net_s = f"{net:,.0f}" if isinstance(net, (int, float)) else "—"
+            note = nb.get("status_note") or "须结合内资大小单结构判断内外资是否分歧。"
+            parts.append(
+                f"【北向资金·全市场】{nb.get('trade_date', '')} 北向合计净买 {net_s}。{note}"
+            )
+        else:
+            parts.append(
+                f"【北向资金·全市场】本轮未核实：{nb.get('error') or '接口未返回'}。"
+                "禁止编造北向数字，也禁止说成「字段变动/穿透三级」等未提供的原因。"
+            )
+    fs = pf.get("fund_structure") if isinstance(pf, dict) else None
+    if isinstance(fs, dict):
+        if fs.get("available"):
+            lines = ["【资金细分·行业主力净流入】"]
+            for row in (fs.get("top_inflow") or [])[:6]:
+                if not isinstance(row, dict):
+                    continue
+                lines.append(f"- {row.get('name')}：{row.get('main_net_inflow', 0):,.0f}")
+            if fs.get("note"):
+                lines.append(str(fs["note"]))
+            parts.append("\n".join(lines))
+        else:
+            parts.append(
+                f"【资金细分】本轮未核实：{fs.get('error') or '无数据'}。"
+                f"{fs.get('note') or ''}"
+                "禁止改口成公募/游资比例不明。"
+            )
+    market = fetched.get("market") or {}
+    turnover = market.get("two_market_turnover") if isinstance(market, dict) else None
+    if isinstance(turnover, dict):
+        if turnover.get("available") and turnover.get("amount_yi_text"):
+            partial = "（单边缺失已标注）" if turnover.get("partial") else ""
+            parts.append(
+                f"【两市成交额】{turnover.get('amount_yi_text')}{partial}。"
+                f"{turnover.get('note') or ''}"
+            )
+        else:
+            parts.append(
+                f"【两市成交额】本轮未核实：{turnover.get('error') or '指数成交额未返回'}。"
+                "禁止编造成交额。"
+            )
     matched_flow = pf.get("sector_fund_flow_matched") or []
     if matched_flow:
         lines = ["【板块主力净流入·匹配】"]
@@ -400,8 +468,8 @@ def _compose_user_message(
     parts.append(
         "【用户问题】\n"
         f"{message}\n\n"
-        "请严格按【对用户说话】要求作答：先汇总结论，再自然写技术/资金/框架与理论依据，最后风险失效；"
-        "写成连贯口语，禁止输出【……】框架小标题；禁止 Markdown；禁止内部黑话。"
+        "请严格按【对用户说话】要求作答：涉及方向时先【观点结论】分短线与中期，再展开依据与失效条件；"
+        "写成连贯口语；除【观点结论】外禁止其它【……】框架小标题；禁止 Markdown；禁止内部黑话。"
         "若 live_quote 有盘中价可在开篇结论里顺带说明；日K指标注明截止日。"
         + (f"\n{sector_hint}" if sector_hint else "")
     )
@@ -411,7 +479,7 @@ def _compose_user_message(
 def _should_run_parallel_agents(plan) -> bool:
     if agent_roster_for_plan(plan):
         return True
-    if plan.workflow in ("news_pulse", "dyp_ask", "portfolio_review", "ta_screen"):
+    if plan.workflow in ("news_pulse", "dyp_ask", "portfolio_review", "ta_screen", "situation_advice"):
         return True
     return bool(plan.research_mode)
 
@@ -422,6 +490,11 @@ def _team_lead_extra_parts(fetched: dict, message: str) -> list[str]:
         USER_REPLY_STRUCTURE,
         build_cot_instruction(fetched),
     ]
+    from modules.route_planner import compose_hint
+
+    route_hint = compose_hint(list(fetched.get("routes") or []))
+    if route_hint:
+        parts.append(route_hint)
     if fetched.get("intent_summary"):
         parts.append(
             "【内部任务备忘·勿写入用户正文】"
@@ -437,6 +510,8 @@ def _team_lead_extra_parts(fetched: dict, message: str) -> list[str]:
     hint = _WORKFLOW_HINTS.get(wf)
     if hint:
         parts.append(hint)
+    if needs_dual_horizon(fetched):
+        parts.append(OUTLOOK_INSTRUCTION.strip())
     synth = (fetched.get("research_synthesis_hint") or "").strip()
     if synth:
         parts.append(synth)
@@ -546,11 +621,33 @@ def _strip_llm_time_preamble(text: str) -> str:
     return "\n".join(out).strip()
 
 
-def _finalize_reply(raw: str, symbols: list[str]) -> tuple[str, dict, str, str, list[dict[str, str]]]:
+def _finalize_reply(
+    raw: str,
+    symbols: list[str],
+    *,
+    workflow: str = "",
+) -> tuple[str, dict, str, str, list[dict[str, str]]]:
+    if workflow == "direct_chat":
+        # 普通对话：只保留生成时间，不拉/不展示上证、广度等投研元数据
+        from modules.data_timestamps import _now_label
+
+        meta = {"generated_at": _now_label(), "market": None, "symbols": []}
+        time_banner = f"📅 本回答生成于：{meta['generated_at']}"
+        body = humanize_reply(_strip_llm_time_preamble(strip_cot_leakage(raw)))
+        reply = f"{time_banner}\n\n{body}".strip() if body else time_banner
+        return reply, meta, time_banner, body, []
+
     meta = collect_reference_meta(symbols)
     time_banner = format_time_banner(meta)
-    body_raw = _strip_llm_time_preamble(humanize_reply(strip_cot_leakage(raw)))
-    outlook, body = parse_outlook(body_raw)
+    # Parse outlook BEFORE humanize — humanize used to join 观点结论/短期/中期
+    # into one「；」line and wipe the card UI.
+    pre = _strip_llm_time_preamble(strip_cot_leakage(raw))
+    outlook, body_wo = parse_outlook(pre)
+    body = humanize_reply(body_wo)
+    # If humanize somehow still left a collapsed block, re-parse once
+    if not outlook and ("短期" in body and "中期" in body):
+        outlook, body = parse_outlook(body)
+        body = humanize_reply(body) if outlook else body
     reply_body = body
     if outlook:
         block_lines = [OUTLOOK_SECTION_TITLE]
@@ -561,6 +658,7 @@ def _finalize_reply(raw: str, symbols: list[str]) -> tuple[str, dict, str, str, 
             block_lines.append(f"中期（1～2周）：{it['medium_text']}")
             block_lines.append("")
         outlook_block = "\n".join(block_lines).strip()
+        # Persist multi-line outlook so history reload can re-parse cards
         reply_body = f"{outlook_block}\n\n{body}".strip() if body else outlook_block
     reply = f"{time_banner}\n\n{reply_body}" if reply_body else time_banner
     return reply, meta, time_banner, body, outlook
@@ -624,13 +722,16 @@ def _prepare_ask_llm(
     purge_expired()
 
     plan = plan_query(message, user_selected)
-    plan, semantic = plan_semantics(message, plan)
+    # 大模型判意图 → 再路由（上文供追问承接；禁止关键词先判）
+    plan, semantic = plan_semantics(message, plan, prior_turns=prior)
+    # 有效标的以语义结果为准（含 LLM 决定是否挂载 UI 候选）
+    effective = list(plan.symbols) if plan.symbols else list(user_selected)
     cache_prefix = _research_cache_prefix(sid, plan, message)
 
     def _load_fetched() -> dict:
         data = fetch_data_for_plan(
             plan,
-            None if no_selection else user_selected,
+            list(plan.symbols) if plan.symbols else (None if no_selection else user_selected),
             message=message,
         )
         data = enrich_research_payload(data, plan)
@@ -769,7 +870,11 @@ def _complete_ask_turn(ctx: dict[str, Any], raw_reply: str) -> dict[str, Any]:
     payload_trimmed = ctx["payload_trimmed"]
     turns = ctx["turns"]
 
-    reply, meta, time_banner, body, outlook = _finalize_reply(raw_reply, effective)
+    reply, meta, time_banner, body, outlook = _finalize_reply(
+        raw_reply,
+        effective,
+        workflow=getattr(plan, "workflow", "") or "",
+    )
 
     charts = []
     if _should_attach_charts(plan, effective):
@@ -826,6 +931,7 @@ def _complete_ask_turn(ctx: dict[str, Any], raw_reply: str) -> dict[str, Any]:
             "intents": plan.intents,
             "symbols": plan.symbols or effective,
             "workflow": plan.workflow,
+            "routes": list(plan.routes or []),
             "research_mode": plan.research_mode,
             "skills": list(skill_names),
             "semantic_source": plan.semantic_source,
@@ -882,8 +988,11 @@ def ask_stream_events(
         for delta in chat_stream(ctx["messages"], temperature=0.25):
             chunks.append(delta)
             display = humanize_stream_display(strip_cot_leakage("".join(chunks)))
-            if len(display) < len(display_sent):
-                display_sent = ""
+            # humanize 可能因未闭合 Markdown 回缩全文；此时必须整段替换，不能只追加
+            if display_sent and not display.startswith(display_sent):
+                yield {"event": "delta", "text": display, "replace": True}
+                display_sent = display
+                continue
             piece = display[len(display_sent) :]
             display_sent = display
             if piece:

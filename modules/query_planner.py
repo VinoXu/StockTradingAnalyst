@@ -51,7 +51,14 @@ _WORKFLOW_SECTOR = frozenset({
 })
 _WORKFLOW_MARKET = frozenset({
     "market_overview", "risk_scan", "opportunity_scan", "question_deep_dive", "capital_flow",
+    "situation_advice",
 })
+
+_SITUATION_ADVICE_HINTS = (
+    "被套", "解套", "回本", "赚回来", "扳回来", "翻本", "摊薄", "补仓",
+    "亏损", "浮亏", "套牢", "怎么操作才能", "如何回本",
+    "手里", "整体", "全部仓位", "所有仓", "整盘", "账户", "总仓", "盘子",
+)
 
 
 def _match_sectors_in_message(message: str) -> list[str]:
@@ -107,6 +114,18 @@ def _wants_ta_screen(message: str) -> bool:
     return any(h in msg for h in _TA_SCREEN_HINTS)
 
 
+def _wants_situation_advice(message: str) -> bool:
+    """开放式持仓处境：被套/回本/解套等，即使无代码也要给技术路径框架。"""
+    msg = (message or "").strip()
+    if not msg:
+        return False
+    if any(h in msg for h in _SITUATION_ADVICE_HINTS):
+        return True
+    if "ETF" in msg.upper() and any(k in msg for k in ("亏", "套", "回本", "赚回", "操作")):
+        return True
+    return False
+
+
 def _wants_portfolio_review(message: str, plan: QueryPlan) -> bool:
     """显式组合复盘话术才走 portfolio-review；普通「分析持仓」仍走个股深研。"""
     msg = (message or "").strip()
@@ -116,7 +135,9 @@ def _wants_portfolio_review(message: str, plan: QueryPlan) -> bool:
 def _resolve_research_mode(plan: QueryPlan) -> str:
     """symbol_research: 个股+研报；sector_research: 板块无研报。"""
     # 专用 workflow 不占深研 mode，避免误跑 6 Agent / 误写 thesis
-    if plan.workflow in ("news_pulse", "dyp_ask", "portfolio_review", "ta_screen"):
+    if plan.workflow in (
+        "news_pulse", "dyp_ask", "portfolio_review", "ta_screen", "situation_advice", "direct_chat",
+    ):
         return ""
     if plan.portfolio_focus and plan.workflow == "portfolio_review":
         return ""
@@ -129,11 +150,30 @@ def _resolve_research_mode(plan: QueryPlan) -> str:
     return ""
 
 
+def _has_invest_analysis_signal(plan: QueryPlan, intents: list[str]) -> bool:
+    """是否具备投资取数/分析信号（有则走投研链路，无则直接 LLM 对话）。"""
+    if plan.routes or plan.symbols or plan.matched_sectors:
+        return True
+    if plan.sector_only or plan.wants_sector_pick or plan.portfolio_focus:
+        return True
+    if intents:
+        return True
+    return False
+
+
 def _detect_workflow(message: str, intents: list[str], plan: QueryPlan) -> str:
+    """兼容入口：优先用已检测的 routes 推导主 workflow。"""
+    from modules.route_planner import primary_workflow
+
+    if plan.routes:
+        return primary_workflow(plan.routes, has_symbols=bool(plan.symbols))
+
     if _wants_news_pulse(message) and (plan.symbols or plan.sector_only or plan.matched_sectors):
         return "news_pulse"
     if _wants_dyp_ask(message):
         return "dyp_ask"
+    if _wants_situation_advice(message):
+        return "situation_advice"
     if _wants_portfolio_review(message, plan):
         return "portfolio_review"
     if _wants_ta_screen(message) and (plan.symbols or plan.sector_only or plan.wants_sector_pick or plan.matched_sectors):
@@ -161,6 +201,9 @@ def _detect_workflow(message: str, intents: list[str], plan: QueryPlan) -> str:
         return "capital_flow"
     if "compare" in intents:
         return "sector_deep_dive"
+    # 解析后无投资信号 → 直接 LLM 对话（非寒暄特判）
+    if not _has_invest_analysis_signal(plan, intents):
+        return "direct_chat"
     return "question_deep_dive"
 
 _PORTFOLIO_VERBS = (
@@ -186,12 +229,16 @@ class QueryPlan:
     keywords: list[str] = field(default_factory=list)
     intents: list[str] = field(default_factory=list)
     symbols: list[str] = field(default_factory=list)
+    # UI 勾选仅作候选；是否纳入本轮由语义 LLM 决定
+    selected_candidates: list[str] = field(default_factory=list)
     needs_market: bool = False
     needs_sectors: bool = False
     sector_only: bool = False
     portfolio_focus: bool = False
     question_driven: bool = False
     workflow: str = ""
+    # 语义多路由（可叠加）；workflow 仅为主标签兼容旧逻辑
+    routes: list[str] = field(default_factory=list)
     wants_sector_pick: bool = False
     matched_sectors: list[str] = field(default_factory=list)
     # 区间板块排行：由语义窗口（如近两周）驱动，需拉指数并计算
@@ -200,7 +247,7 @@ class QueryPlan:
     needs_charts: bool = False
     chart_kinds: list[str] = field(default_factory=list)
     research_mode: str = ""
-    # --- 语义规划（规则 + LLM）；映射表仅作参考 ---
+    # --- 语义规划（LLM 主导意图与路由）---
     semantic_source: str = ""
     intent_summary: str = ""
     semantic_confidence: str = ""
@@ -224,6 +271,33 @@ def _sector_only_query(message: str, intents: list[str]) -> bool:
 
 
 def plan_query(message: str, selected: list[str] | None = None) -> QueryPlan:
+    """
+    仅做结构槽位（代码 / 点名持仓 / UI 候选），不做意图关键词分类。
+    意图、routes、workflow 一律由 semantic_planner（大模型）判定后再写入。
+    """
+    msg = (message or "").strip()
+    plan = QueryPlan()
+    codes: set[str] = set()
+    for m in _CODE_RE.finditer(msg):
+        codes.add(m.group(1).split(".")[0])
+    for h in list_holdings():
+        nm = (h.get("name") or "").strip()
+        if len(nm) >= 2 and nm in msg:
+            codes.add(h["symbol"].split(".")[0])
+    plan.symbols = sorted(codes)
+    plan.selected_candidates = [s.split(".")[0] for s in (selected or []) if s]
+    plan.question_driven = True
+    plan.workflow = ""
+    plan.routes = []
+    plan.intents = []
+    plan.keywords = []
+    plan.needs_market = False
+    plan.needs_sectors = False
+    return plan
+
+
+def plan_query_by_rules(message: str, selected: list[str] | None = None) -> QueryPlan:
+    """关键词规则回退：仅当语义 LLM 关闭或调用失败时使用。"""
     msg = (message or "").strip()
     lower = msg.lower()
     plan = QueryPlan()
@@ -238,35 +312,76 @@ def plan_query(message: str, selected: list[str] | None = None) -> QueryPlan:
         codes.add(m.group(1).split(".")[0])
 
     plan.sector_only = _sector_only_query(msg, plan.intents)
-    if not plan.sector_only:
+    _SELECTED_ATTACH_VERBS = (
+        "分析", "评价", "看看", "诊断", "建议", "走势",
+        "涨", "跌", "突破", "支撑", "阻力", "持有", "自选", "标的", "仓位", "复盘",
+        "机会", "风险", "资金", "大盘", "板块", "行情", "股票",
+    )
+    attach_selected = bool(plan.intents) or bool(codes) or any(v in msg for v in _SELECTED_ATTACH_VERBS)
+    if not plan.sector_only and attach_selected:
         for sel in selected or []:
             codes.add(sel.split(".")[0])
         for h in list_holdings():
             nm = h.get("name") or ""
             if len(nm) >= 2 and nm in msg:
                 codes.add(h["symbol"].split(".")[0])
+    elif not plan.sector_only:
+        for h in list_holdings():
+            nm = h.get("name") or ""
+            if len(nm) >= 2 and nm in msg:
+                codes.add(h["symbol"].split(".")[0])
 
     plan.symbols = sorted(codes)
+    plan.selected_candidates = [s.split(".")[0] for s in (selected or []) if s]
     plan.needs_sectors = plan.sector_only or "sector" in plan.intents
     plan.needs_market = (
         "market" in plan.intents
         or plan.needs_sectors
         or plan.sector_only
-        or not plan.symbols
     )
     plan.needs_charts = any(h in msg for h in _CHART_HINTS) or "tech" in plan.intents
+
+    from modules.route_planner import detect_routes, fetch_flags_for_routes
+
+    plan.matched_sectors = _match_sectors_in_message(msg)
+    sel_for_route = list(selected or []) if attach_selected else []
+    plan.routes = detect_routes(
+        msg,
+        intents=plan.intents,
+        symbols=plan.symbols,
+        matched_sectors=plan.matched_sectors,
+        selected=sel_for_route,
+    )
+    route_flags = fetch_flags_for_routes(plan.routes)
+    if route_flags.get("market"):
+        plan.needs_market = True
+    if route_flags.get("sectors"):
+        plan.needs_sectors = True
 
     if plan.needs_charts:
         plan.chart_kinds.append("price")
         if any(k in lower for k in ("rsi", "指标", "macd")):
             plan.chart_kinds.append("rsi")
 
-    if (selected or []) and not plan.sector_only:
+    if attach_selected and (selected or []) and not plan.sector_only:
         sel_codes = {s.split(".")[0] for s in selected or []}
         plan.symbols = sorted(set(plan.symbols) | sel_codes)
+        plan.routes = detect_routes(
+            msg,
+            intents=plan.intents,
+            symbols=plan.symbols,
+            matched_sectors=plan.matched_sectors,
+            selected=list(selected or []),
+        )
         broad_market = _explicit_market_question(msg, plan.intents)
         wants_portfolio = _wants_portfolio_analysis(msg, plan.intents)
-        if wants_portfolio and not broad_market and "sector" not in plan.intents:
+        if (
+            wants_portfolio
+            and not broad_market
+            and "sector" not in plan.intents
+            and "discuss" not in plan.routes
+            and "market" not in plan.routes
+        ):
             plan.portfolio_focus = True
             plan.needs_market = False
             plan.needs_sectors = False
@@ -275,27 +390,30 @@ def plan_query(message: str, selected: list[str] | None = None) -> QueryPlan:
     else:
         plan.question_driven = True
         plan.wants_sector_pick = _wants_sector_pick(msg)
-        plan.matched_sectors = _match_sectors_in_message(msg)
         plan.workflow = _detect_workflow(msg, plan.intents, plan)
         plan.research_mode = _resolve_research_mode(plan)
-        if plan.workflow in _WORKFLOW_SECTOR or plan.matched_sectors:
-            plan.needs_sectors = True
-        if plan.workflow in _WORKFLOW_MARKET:
-            plan.needs_market = True
-        if plan.workflow == "named_symbols" and plan.symbols:
-            plan.needs_market = bool("market" in plan.intents)
-        elif plan.workflow == "question_deep_dive":
-            plan.needs_market = True
-            plan.needs_sectors = True
+        route_flags = fetch_flags_for_routes(plan.routes)
+        if plan.workflow == "direct_chat":
+            plan.needs_market = False
+            plan.needs_sectors = False
+            plan.needs_charts = False
+            plan.chart_kinds = []
+            plan.routes = ["direct_chat"]
+        else:
+            if route_flags.get("market") or plan.workflow in _WORKFLOW_MARKET:
+                plan.needs_market = True
+            if route_flags.get("sectors") or plan.workflow in _WORKFLOW_SECTOR or plan.matched_sectors:
+                plan.needs_sectors = True
+            if plan.wants_sector_pick:
+                plan.needs_sectors = True
 
-    if plan.workflow == "portfolio_review":
+    if plan.workflow == "portfolio_review" and "discuss" not in plan.routes and "market" not in plan.routes:
         plan.needs_market = False
         plan.needs_sectors = False
         if not plan.symbols:
             plan.symbols = [h["symbol"].split(".")[0] for h in list_holdings()][:8]
 
-    if plan.workflow == "dyp_ask":
-        # 段式问答可不拉板块广度
+    if plan.workflow == "dyp_ask" and "sector" not in plan.routes:
         plan.needs_sectors = False
 
     lookback = infer_sector_lookback_trading_days(msg)
@@ -304,7 +422,8 @@ def plan_query(message: str, selected: list[str] | None = None) -> QueryPlan:
     if plan.wants_sector_period_rank:
         plan.needs_sectors = True
         plan.sector_only = plan.sector_only or not plan.symbols
-        # 区间排行 ≠ 板块优选：清掉 sector_research，避免 TA 扫描/重型编排
+        if "sector" not in plan.routes:
+            plan.routes.append("sector")
         if not plan.wants_sector_pick:
             plan.research_mode = ""
             if plan.workflow in ("", "question_deep_dive", "named_symbols", "sector_research"):
@@ -316,6 +435,96 @@ def plan_query(message: str, selected: list[str] | None = None) -> QueryPlan:
                 plan.research_mode = "sector_research"
 
     plan.keywords = list(dict.fromkeys(plan.keywords))[:12]
+    return plan
+
+
+def promote_followup_plan(
+    plan: QueryPlan,
+    message: str,
+    prior_turns: list[tuple[str, str]] | None,
+) -> QueryPlan:
+    """
+    承接上文的追问（如「请问你怎么看待这件事」）勿落入 direct_chat：
+    按上一轮主题继承取数与 workflow，并保留 question_driven。
+    """
+    if not prior_turns or plan.workflow != "direct_chat":
+        return plan
+
+    from modules.conversation_memory import (
+        _extract_topics,
+        _strip_time_banner,
+        assess_memory_relevance,
+        is_discourse_followup,
+    )
+
+    followup = is_discourse_followup(message)
+    related = bool(assess_memory_relevance(message, prior_turns).get("related"))
+    if not followup and not related:
+        return plan
+
+    last_q, last_a = prior_turns[-1]
+    blob = f"{last_q}\n{_strip_time_banner(last_a)}"
+    topics = _extract_topics(blob)
+
+    market_signals = (
+        "大盘",
+        "市场",
+        "指数",
+        "上证",
+        "深证",
+        "沪深",
+        "两市",
+        "成交额",
+        "涨跌家数",
+        "主力净流入",
+        "北向",
+        "观点结论",
+        "偏多",
+        "偏空",
+        "观望",
+    )
+    sector_signals = ("板块", "行业", "概念", "题材", "轮动")
+    market_topics = {
+        "大盘",
+        "市场",
+        "指数",
+        "上证",
+        "深证",
+        "沪深",
+        "两市",
+        "牛市",
+        "熊市",
+        "回调",
+        "反弹",
+        "资金",
+        "北向",
+        "主力",
+    }
+    sector_topics = {"板块", "行业", "概念", "题材"}
+
+    has_market = bool(topics & market_topics) or any(k in blob for k in market_signals)
+    has_sector = bool(topics & sector_topics) or any(k in blob for k in sector_signals)
+
+    plan.question_driven = True
+    routes = list(plan.routes or [])
+
+    if has_sector and not has_market:
+        plan.workflow = "sector_deep_dive"
+        plan.needs_sectors = True
+        if "sector" not in routes:
+            routes.append("sector")
+    else:
+        # 默认按大盘/投研承接（上一轮多为市场综述时尤其如此）
+        plan.workflow = "market_overview" if has_market else "question_deep_dive"
+        plan.needs_market = True
+        if "market" not in routes:
+            routes.append("market")
+        if has_sector:
+            plan.needs_sectors = True
+            if "sector" not in routes:
+                routes.append("sector")
+
+    plan.routes = routes
     return plan
 
 
@@ -366,6 +575,33 @@ def fetch_data_for_plan(
     message: str = "",
 ) -> dict[str, Any]:
     """Call domain APIs based on extracted slots."""
+    # 直接对话：不取行情/板块/资金，避免闲聊也打东财接口
+    if plan.workflow == "direct_chat":
+        return {
+            "retrieved_at": _now_label(),
+            "query_keywords": plan.keywords,
+            "query_intents": plan.intents,
+            "sector_only": False,
+            "portfolio_focus": False,
+            "question_driven": True,
+            "workflow": "direct_chat",
+            "routes": [],
+            "research_mode": "",
+            "wants_sector_pick": False,
+            "matched_sectors": [],
+            "semantic_source": plan.semantic_source,
+            "intent_summary": plan.intent_summary,
+            "semantic_confidence": plan.semantic_confidence,
+            "task_briefs": [],
+            "data_reference": {
+                "generated_at": _now_label(),
+                "market": None,
+                "symbols": [],
+                "granularity": "none",
+                "granularity_note": "",
+            },
+        }
+
     symbols = list(plan.symbols)
     if (
         not symbols
@@ -393,6 +629,7 @@ def fetch_data_for_plan(
         "portfolio_focus": plan.portfolio_focus,
         "question_driven": plan.question_driven,
         "workflow": plan.workflow,
+        "routes": list(plan.routes or []),
         "research_mode": plan.research_mode,
         "wants_sector_pick": plan.wants_sector_pick,
         "matched_sectors": plan.matched_sectors,
@@ -422,14 +659,13 @@ def fetch_data_for_plan(
             _MARKET_CACHE_TTL,
             lambda: collect_market_context(refresh_breadth=refresh_breadth),
         )
+        market = dict(market)
         index_live = get_live_quote("INDEX.SH000001")
         index_live_sz = get_live_quote("INDEX.SZ399001")
-        if (index_live and index_live.get("available")) or (index_live_sz and index_live_sz.get("available")):
-            market = dict(market)
-            if index_live and index_live.get("available"):
-                market["index_live"] = index_live
-            if index_live_sz and index_live_sz.get("available"):
-                market["index_live_sz"] = index_live_sz
+        if index_live:
+            market["index_live"] = index_live
+        if index_live_sz:
+            market["index_live_sz"] = index_live_sz
         payload["market"] = market
 
     if want_sectors:
@@ -501,6 +737,16 @@ def fetch_data_for_plan(
         ]
         payload["participant_flow"] = collect_market_participant_context(sector_keywords=kws)
 
+    # 大盘问答：成交额/北向/资金细分必须落成结构化字段（有值或明确缺因）
+    if payload.get("market") is not None:
+        from modules.market_essentials import ensure_market_essentials, ensure_participant_essentials
+        from modules.participant_flow import collect_market_participant_context
+
+        payload["market"] = ensure_market_essentials(payload.get("market") or {})
+        if "participant_flow" not in payload:
+            payload["participant_flow"] = collect_market_participant_context(sector_keywords=[])
+        payload["participant_flow"] = ensure_participant_essentials(payload.get("participant_flow") or {})
+
     # 研报/财报：规则保底（个股深研必拉）∪ 语义 fetch 开关（语义关了也不能关掉深研保底）
     rule_symbol_research = (
         plan.research_mode == "symbol_research"
@@ -523,7 +769,13 @@ def fetch_data_for_plan(
 
         payload["fundamentals"] = collect_fundamentals_for_symbols(symbols)
 
-    need_holdings = bool(sf.get("holdings")) if sf else (plan.workflow == "portfolio_review" or plan.portfolio_focus)
+    need_holdings = bool(sf.get("holdings")) if sf else (
+        plan.workflow == "portfolio_review"
+        or plan.workflow == "situation_advice"
+        or "holdings" in (plan.routes or [])
+        or "discuss" in (plan.routes or [])
+        or plan.portfolio_focus
+    )
     if need_holdings:
         holdings = list_holdings()
         payload["holdings"] = [
@@ -607,6 +859,7 @@ def compact_payload_for_llm(data: dict[str, Any]) -> dict[str, Any]:
         "portfolio_focus",
         "question_driven",
         "workflow",
+        "routes",
         "research_mode",
         "wants_sector_pick",
         "research_reports",

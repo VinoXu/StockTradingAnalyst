@@ -68,6 +68,14 @@ def humanize_reply(text: str) -> str:
     t = re.sub(r"^[|\-+_=]{3,}.*$", "", t, flags=re.MULTILINE)
     t = re.sub(r"^[▁▂▃▄▅▆▇█░▓▒─│┌┐└┘├┤┬┴┼].*$", "", t, flags=re.MULTILINE)
 
+    def _is_outlook_struct(line: str) -> bool:
+        s = line.strip()
+        return (
+            s.startswith("【观点结论】")
+            or bool(re.match(r"^短期[（(]", s))
+            or bool(re.match(r"^中期[（(]", s))
+        )
+
     out_lines: list[str] = []
     for raw in t.split("\n"):
         line = raw.strip()
@@ -91,17 +99,25 @@ def humanize_reply(text: str) -> str:
 
     merged: list[str] = []
     buf: list[str] = []
+
+    def _flush() -> None:
+        nonlocal buf
+        if buf:
+            merged.append("".join(_join_clauses(buf)))
+            buf = []
+
     for line in out_lines:
         if line == "":
-            if buf:
-                merged.append("".join(_join_clauses(buf)))
-                buf = []
+            _flush()
             if merged and merged[-1] != "":
                 merged.append("")
+        elif _is_outlook_struct(line):
+            # Keep 观点结论/短期/中期 as separate lines for UI card parsing
+            _flush()
+            merged.append(line)
         else:
             buf.append(line)
-    if buf:
-        merged.append("".join(_join_clauses(buf)))
+    _flush()
 
     result = "\n".join(merged)
     result = re.sub(r"\n{3,}", "\n\n", result)

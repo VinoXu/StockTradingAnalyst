@@ -47,8 +47,28 @@ _FOLLOWUP_MARKERS = (
     "那些",
     "这个呢",
     "那个呢",
+    "这件事",
+    "这个事",
+    "此事",
+    "对此",
+    "上述",
+    "前述",
+    "怎么看",
+    "怎么看待",
+    "你怎么看",
+    "你觉得",
+    "你认为",
     "呢？",
     "呢?",
+)
+
+_OPINION_FOLLOWUP = (
+    "怎么看",
+    "怎么看待",
+    "怎么想",
+    "你觉得",
+    "你认为",
+    "怎么理解",
 )
 
 _CODE_RE = re.compile(r"(?<!\d)(\d{6})(?!\d)")
@@ -196,11 +216,19 @@ def build_session_summary(
     return build_session_summary_llm(prior_turns, previous_summary=previous_summary)
 
 
+def is_discourse_followup(message: str) -> bool:
+    """公开：本轮是否像承接上文的追问。"""
+    return _is_discourse_followup(message)
+
+
 def _is_discourse_followup(message: str) -> bool:
     msg = (message or "").strip()
     if not msg:
         return False
     if any(m in msg for m in _FOLLOWUP_MARKERS):
+        return True
+    # 观点/评价类短追问（常接上文：「请问你怎么看待这件事」）
+    if len(msg) <= 24 and any(k in msg for k in _OPINION_FOLLOWUP):
         return True
     # 极短追问（如「为什么？」「会回来吗」）默认视为承接上一轮
     if len(msg) <= 12 and ("？" in msg or "?" in msg or "吗" in msg or "呢" in msg):

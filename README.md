@@ -22,7 +22,7 @@
 
 ## 界面预览
 
-本地 Web 对话界面：左侧导航（新建对话 / 历史 / 自选股 / API 设置），中间为 AI 投研问答，底部可勾选标的并一键问大盘、风险板块、机会板块。
+本地 Web 对话界面：左侧导航（当前对话 / 历史 / 自选股 / API 设置），聊天区右上角可新建对话；中间为 AI 投研问答，底部可勾选标的并一键问大盘、风险板块、机会板块。
 
 ![Profit Protector 对话界面](https://raw.githubusercontent.com/VinoXu/StockTradingAnalyst/main/docs/images/chat-ui.png)
 
@@ -54,19 +54,35 @@ Profit_Protector/
 
 ```text
 用户问题
-  → query_planner（规则：关键词/槽位 → 线索）
-  → semantic_planner（LLM 意图分析 + 任务拆分；映射表仅参考；失败回退规则）
+  → query_planner（仅结构槽位：代码 / 点名持仓 / UI 候选；不做关键词意图）
+  → semantic_planner（大模型判意图 → routes / fetch / agents；失败才回退规则）
   → fetch_data_for_plan（按语义 fetch 需求取数）
-  → research_orchestrator（证据包 + QA）
-  → agent_parallel（按拆分后的 Agent/Skill 并行）
-  → skill_mapper + Team Lead（注入语义指定的场景 Skill）
-  → context_guard（payload 体积预检）
-  → LLM 流式输出
-  → investment_thesis（仅完整个股深研）
-  → 会话摘要
+    → research_orchestrator（证据包 + QA）
+    → agent_parallel（按拆分后的 Agent/Skill 并行）
+    → skill_mapper + Team Lead（注入语义指定的场景 Skill）
+    → context_guard（payload 体积预检）
+    → LLM 流式输出
+    → investment_thesis（仅完整个股深研）
+    → 会话摘要
 ```
 
-可选环境变量：`SEMANTIC_LLM_PLANNER=0` 关闭 LLM 语义规划（纯规则）；`RESEARCH_PARALLEL_AGENTS=0` 关闭并行 Agent。
+可选环境变量：`SEMANTIC_LLM_PLANNER=0` 关闭 LLM 语义规划（回退关键词规则，不推荐）；`RESEARCH_PARALLEL_AGENTS=0` 关闭并行 Agent。
+
+### 路由定义（`modules/route_planner.py`）
+
+语义规划器从白名单中选路由（投研路由可叠加；`direct_chat` 互斥）：
+
+| 路由 | 何时选用 | 取数 |
+|------|----------|------|
+| `market` | 大盘/指数/广度/成交额等整体环境 | 大盘 |
+| `sector` | 板块/主线/题材/区间排行 | 板块 |
+| `symbol` | 点名个股或要对具体标的做研究 | 行情等 |
+| `discuss` | 被套/回本/整盘怎么操作等处境讨论（无代码也要答） | 大盘+持仓 |
+| `capital` | 主力/北向/融资/资金流向 | 资金相关 |
+| `holdings` | 结合持仓/自选复盘或对照 | 持仓+行情 |
+| `direct_chat` | **与 A 股投研无关**（寒暄、天气、编程、闲聊等）；不需要行情数据 | **不取数** |
+
+`direct_chat` 行为：不拉行情/板块/资金，不派投研 Agent，轻量直接对话。承接上文投研话题的追问不得误判为 `direct_chat`。
 
 ## 环境要求
 
@@ -117,7 +133,7 @@ LLM_WARN_INPUT_CHARS=75000
 RESEARCH_PARALLEL_AGENTS=0
 ```
 
-可选：关闭 LLM 语义规划（纯规则回退，默认开启）：
+可选：关闭 LLM 语义规划（回退关键词规则，不推荐；默认开启）：
 
 ```text
 SEMANTIC_LLM_PLANNER=0

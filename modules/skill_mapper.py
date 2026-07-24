@@ -31,6 +31,7 @@ _WORKFLOW_MURPHY: dict[str, tuple[str, ...]] = {
     "opportunity_scan": ("ta-trend-structure",),
     "capital_flow": ("ta-trend-structure",),
     "question_deep_dive": ("ta-trend-structure",),
+    "situation_advice": ("ta-trend-structure", "ta-volume-price", "ta-investment-checklist"),
     "symbol_research": ("ta-trend-structure", "ta-price-patterns", "ta-volume-price"),
     "sector_research": ("ta-trend-structure", "ta-volume-price"),
     "news_pulse": ("ta-trend-structure", "ta-volume-price"),
@@ -60,6 +61,9 @@ def _ordered_existing(names: tuple[str, ...] | list[str]) -> tuple[str, ...]:
 
 def select_skills_for_plan(plan: QueryPlan, *, scope: str = "open", team_lead: bool = False) -> tuple[str, ...]:
     """Return Skill names to inject for this turn (Murphy / Nison 分包，不混注)."""
+    if plan.workflow == "direct_chat":
+        return ()
+
     if team_lead or uses_parallel_agents(plan):
         tl = _ordered_existing(team_lead_skills_for_plan(plan))
         if tl:

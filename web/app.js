@@ -51,7 +51,6 @@ const chatMessages = document.getElementById('chatMessages');
 const chatEmpty = document.getElementById('chatEmpty');
 const inputBottom = document.getElementById('inputBottom');
 const sendBtn = document.getElementById('sendBtn');
-const loadingBar = document.getElementById('loadingBar');
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
 const selectedSummary = document.getElementById('selectedSummary');
@@ -325,12 +324,11 @@ function appendBubble(role, text, { noScroll = false, charts = null, timeBanner 
     bubble.className = 'bubble-user';
   } else if (role === 'typing') {
     bubble.className = 'bubble-typing';
-    bubble.innerHTML = formatTypingBubbleHtml('正在分析，请稍候…');
+    bubble.innerHTML = formatTypingBubbleHtml('正在分析');
   } else {
     bubble.className = 'bubble-ai';
   }
   if (role !== 'typing') {
-    bubble.style.whiteSpace = 'pre-wrap';
     bubble.textContent = text;
   }
 
@@ -436,11 +434,13 @@ function beginStreamBubble() {
   streamBubble = streamRow.querySelector('.bubble-ai');
 }
 
-function appendStreamDelta(text) {
-  if (!text) return;
+function appendStreamDelta(text, { replace = false } = {}) {
+  if (text == null) return;
+  if (!replace && !text) return;
   beginStreamBubble();
   if (streamBubble) {
-    streamBubble.textContent += text;
+    if (replace) streamBubble.textContent = text;
+    else streamBubble.textContent += text;
     scrollChatBottom();
   }
 }
@@ -497,7 +497,8 @@ async function consumeChatStream(msg) {
       if (ev.event === 'phase') {
         /* 保持 analyzingHint 动态文案；phase 仅用于内部状态 */
       } else if (ev.event === 'delta') {
-        appendStreamDelta(ev.text || '');
+        if (ev.replace) appendStreamDelta(ev.text || '', { replace: true });
+        else appendStreamDelta(ev.text || '');
       } else if (ev.event === 'done') {
         doneData = ev.data;
       } else if (ev.event === 'error') {
@@ -568,10 +569,7 @@ async function clearChatAfterHistoryWiped() {
 }
 
 document.querySelectorAll('[data-view]').forEach((item) => {
-  item.addEventListener('click', () => {
-    if (item.dataset.view === 'chat') startNewChat();
-    else switchView(item.dataset.view);
-  });
+  item.addEventListener('click', () => switchView(item.dataset.view));
 });
 
 document.getElementById('newChatBtn').addEventListener('click', startNewChat);
@@ -945,13 +943,10 @@ function applyContextStatus(data) {
 }
 
 function analyzingHint(elapsedSec) {
-  const n = selected.length;
-  const head = n > 1 ? `正在分析 ${n} 只标的，` : '正在分析，';
-  if (elapsedSec < 12) return `${head}正在拉行情与 K 线…（通常 1～3 分钟，可点停止）`;
-  if (elapsedSec < 60) return `${head}已等待 ${elapsedSec} 秒，大模型生成中…`;
+  if (elapsedSec < 60) return `正在分析（已等待 ${elapsedSec} 秒）`;
   const m = Math.floor(elapsedSec / 60);
   const s = elapsedSec % 60;
-  return `${head}已等待 ${m} 分 ${s} 秒，可随时停止后重新提问`;
+  return `正在分析（已等待 ${m} 分 ${s} 秒）`;
 }
 
 function updateAnalyzingUI() {
@@ -997,7 +992,6 @@ function setLoading(on) {
   sending = on;
   sendBtn.disabled = contextFull && !on;
   setSendButtonMode(on ? 'stop' : 'send');
-  loadingBar.classList.toggle('hidden', !on);
   if (on) startAnalyzingUI();
   else stopAnalyzingUI();
 }
