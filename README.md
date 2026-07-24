@@ -18,7 +18,7 @@
 | **李录** | `master-li` | 3～5 年产业趋势与长期确定性；板块赛道逻辑，也可落到个股产业语境 |
 
 **资金面**  
-`a-share-capital-flow` 看的是参与者资金行为（主力净流入估算、北向、两融、龙虎榜等），用来验证「价格运动有没有资金配合」。它与上表技术框架 / 投资人视角**不在同一维度**：上表回答「怎么判断」，资金面回答「谁在买、钱往哪流」。
+`a-share-capital-flow` 看的是参与者资金行为（主力净流入估算、北向、两融、龙虎榜等），用来验证「价格运动有没有资金配合」。
 
 ## 界面预览
 
@@ -30,7 +30,7 @@
 
 ```text
 Profit_Protector/
-├── README.md              ← 本文件
+├── README.md             
 ├── app.py                 ← Web 入口 (http://127.0.0.1:7860)
 ├── requirements.txt
 ├── .env.example
@@ -54,8 +54,8 @@ Profit_Protector/
 
 ```text
 用户问题
-  → query_planner（仅结构槽位：代码 / 点名持仓 / UI 候选；不做关键词意图）
-  → semantic_planner（大模型判意图 → routes / fetch / agents；失败才回退规则）
+  → query_planner（仅结构槽位：代码 / 点名持仓 / UI 候选）
+  → semantic_planner（大模型判意图 → routes / fetch / agents）
   → fetch_data_for_plan（按语义 fetch 需求取数）
     → research_orchestrator（证据包 + QA）
     → agent_parallel（按拆分后的 Agent/Skill 并行）
@@ -66,7 +66,7 @@ Profit_Protector/
     → 会话摘要
 ```
 
-可选环境变量：`SEMANTIC_LLM_PLANNER=0` 关闭 LLM 语义规划（回退关键词规则，不推荐）；`RESEARCH_PARALLEL_AGENTS=0` 关闭并行 Agent。
+可选环境变量：`SEMANTIC_LLM_PLANNER=0` 关闭 LLM 语义规划；`RESEARCH_PARALLEL_AGENTS=0` 关闭并行 Agent。
 
 ### 路由定义（`modules/route_planner.py`）
 
@@ -191,7 +191,7 @@ python app.py
 | `sync_market.py` | 同步指数 + 市场广度 |
 | `sync_symbol.py` | 同步个股行情、指标、资金流 |
 | `portfolio_cli.py` | 持仓 add / list / remove |
-| `chat_advisor.py` | CLI 交互问答（**未**走 Web 多 Agent / 语义规划；全量 Skill） |
+| `chat_advisor.py` | CLI 交互问答 |
 | `advise_portfolio.py` | 组合批量建议 |
 | `advise_symbol.py` | 单标的建议 |
 | `diagnose_akshare.py` | 数据源连通诊断 |
